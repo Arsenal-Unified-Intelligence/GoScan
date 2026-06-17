@@ -18,11 +18,15 @@ those hosts get a full port scan.
 
 ## How it works
 
-1. **Tiered discovery** — an ICMP echo sweep first (cheap, one packet per host), then a TCP
-   "knock" on a small set of common ports for hosts that don't answer ICMP (catches hosts
-   with host-based firewalls that drop ping).
+1. **Tiered discovery** — an ICMP echo sweep first (cheap, one packet per host, concurrency
+   scaled by the discovery timing template), then a short-timeout TCP "knock" on a tight set
+   of high-signal ports (443, 80, 22, 445, 3389) for hosts that don't answer ICMP (catches
+   hosts with host-based firewalls that drop ping). The knock is **RST-aware**: a host that
+   actively refuses a probe is recorded as up, even when none of the knocked ports are open.
 2. **Targeted port scan** — only hosts found "up" in discovery get a full port scan, so empty
-   address space costs only the cheap discovery probe.
+   address space costs only the cheap discovery probe. Because detecting a *new* host is the
+   whole point, discovery still touches every address; it just makes the per-address probe
+   cheap rather than skipping address space.
 3. **Structured output** — JSON (default), with per-host fingerprints and rich scan metadata,
    plus `txt` and `csv` formats.
 4. **Built-in diff** — compare two JSON scans and emit the changes, with a non-zero exit code
@@ -83,6 +87,16 @@ GoScan -Td 5 -T 4 -sV -o /data/scans/perimeter -oF json 10.20.0.0/16
 GoScan -oF json -o /data/diffs/diff \
   -diff /data/scans/perimeter-2026-06-16.json /data/scans/perimeter-2026-06-20.json
 ```
+
+## Reliability notes
+
+- **File descriptors:** a `connect()` scan uses one descriptor per in-flight probe. GoScan
+  raises its soft `RLIMIT_NOFILE` to the hard limit at startup and caps worker concurrency
+  under that budget. If descriptors are still exhausted mid-scan, the affected dials are
+  retried (never silently counted as "closed"), and a warning reports how many events occurred.
+- **Change-detection stability:** discovery gathers signal from both ICMP and a multi-port,
+  RST-aware TCP knock, so a single dropped packet is unlikely to flip a live host to "down"
+  and create spurious `NEW_HOST`/`CLOSED_HOST` churn in diffs.
 
 ## Privileges
 

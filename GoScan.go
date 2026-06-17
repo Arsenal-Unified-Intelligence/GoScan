@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -23,7 +24,7 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
-const version = "1.1"
+const version = "1.2"
 
 const (
 	defaultTimeout = 2 * time.Second
@@ -32,8 +33,23 @@ const (
 	maxWorkers     = 10000
 	connectTimeout = 1500 * time.Millisecond
 	readTimeout    = 500 * time.Millisecond
-	pingTimeout    = 2 * time.Second
+	pingTimeout    = 1 * time.Second
 	pingRetries    = 1
+
+	// discoveryProbeTimeout is the per-port TCP knock timeout during host
+	// discovery. Kept short: on a sparse /16 the runtime is dominated by waiting
+	// on dead IPs, and a host that is actually up answers well under this.
+	discoveryProbeTimeout = 400 * time.Millisecond
+
+	// maxResourceRetries bounds how many times a single dial will retry after a
+	// file-descriptor exhaustion error (EMFILE/ENFILE) before giving up. These
+	// errors are transient — other in-flight dials complete and free fds — so we
+	// retry rather than misclassify a possibly-open port as closed.
+	maxResourceRetries = 40
+
+	// fdReserve is the number of file descriptors held back from the worker pool
+	// for stdout, the ICMP socket, output files, etc.
+	fdReserve = 256
 )
 
 var asciiArt = `
@@ -94,7 +110,11 @@ var timingTemplates = map[string]TimingTemplate{
 	},
 }
 
-var discoveryPorts = []int{80, 443, 22, 21, 25, 3389, 8080, 8443}
+// discoveryPorts is a tight, high-signal set used only for the host-discovery
+// TCP knock — web (443/80), Linux/network gear (22), and Windows (445/3389).
+// Kept small deliberately: every extra port multiplies across the entire
+// address space. The full port scan of live hosts covers everything else.
+var discoveryPorts = []int{443, 80, 22, 445, 3389}
 
 var top100Ports = []int{
 	80, 23, 443, 21, 22, 25, 3389, 110, 445, 139,
@@ -189,6 +209,7 @@ type Scanner struct {
 	scanned        int64
 	openPorts      int64
 	filteredPorts  int64
+	resourceErrors int64
 	lastHostScan   sync.Map
 	rttSamples     []time.Duration
 	rttMu          sync.Mutex
@@ -199,6 +220,8 @@ type Scanner struct {
 	outputFile   string
 	outputFormat string
 	isatty       bool
+
+	fdLimit uint64 // soft open-file limit, used to cap discovery concurrency
 }
 
 // icmpResponse / icmpRequest used by the centralized ICMP dispatcher.
@@ -267,7 +290,7 @@ func main() {
 	}
 
 	if flag.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "Error: target is required\n")
+		fmt.Fprintln(os.Stderr, "Error: target is required")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -309,6 +332,15 @@ func main() {
 	if finalWorkers > maxWorkers {
 		fmt.Fprintf(os.Stderr, "Warning: workers limited to %d\n", maxWorkers)
 		finalWorkers = maxWorkers
+	}
+
+	// Raise the fd limit and cap concurrency under it. A connect() scan uses one
+	// descriptor per in-flight probe; exceeding the limit makes dials fail with
+	// EMFILE, which must not be mistaken for a closed port.
+	fdLimit := raiseFDLimit()
+	if capped := capConcurrency(finalWorkers, fdLimit); capped < finalWorkers {
+		fmt.Fprintf(os.Stderr, "Warning: workers limited to %d by file-descriptor limit (ulimit -n %d)\n", capped, fdLimit)
+		finalWorkers = capped
 	}
 
 	finalTimeout := *timeout
@@ -359,6 +391,7 @@ func main() {
 		outputFile:   outFile,
 		outputFormat: *outputFormat,
 		isatty:       tty,
+		fdLimit:      fdLimit,
 	}
 
 	if !quietMode {
@@ -558,16 +591,28 @@ func (s *Scanner) pingHosts(ctx context.Context, ips []string, quiet bool) []str
 	defer conn.Close()
 
 	totalIPs := len(ips)
-	var pingDeadline time.Duration
-	switch {
-	case totalIPs <= 10:
+
+	// Scale ICMP concurrency by the discovery timing template (all echoes share a
+	// single socket, so this just bounds in-flight goroutines, not fds).
+	pingConc := (s.discTiming.MinParallelism + s.discTiming.MaxParallelism) / 2
+	if pingConc < 50 {
+		pingConc = 50
+	}
+	if pingConc > 4096 {
+		pingConc = 4096
+	}
+
+	// Derive the deadline from the actual work and concurrency so large sweeps are
+	// not silently truncated. Worst case per host ≈ two ping timeouts (initial +
+	// one retry) plus a little slack; one "wave" covers pingConc hosts.
+	perHost := 2*pingTimeout + 200*time.Millisecond
+	waves := (totalIPs + pingConc - 1) / pingConc
+	pingDeadline := time.Duration(waves) * perHost * 2
+	if pingDeadline < 30*time.Second {
 		pingDeadline = 30 * time.Second
-	case totalIPs <= 64:
-		pingDeadline = 45 * time.Second
-	case totalIPs <= 256:
-		pingDeadline = 90 * time.Second
-	default:
-		pingDeadline = 180 * time.Second
+	}
+	if pingDeadline > 15*time.Minute {
+		pingDeadline = 15 * time.Minute
 	}
 
 	pingCtx, pingCancel := context.WithTimeout(ctx, pingDeadline)
@@ -627,7 +672,7 @@ func (s *Scanner) pingHosts(ctx context.Context, ips []string, quiet bool) []str
 	}()
 
 	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, 50)
+	semaphore := make(chan struct{}, pingConc)
 	scanned := 0
 
 Loop:
@@ -702,7 +747,7 @@ Loop:
 	<-dispatcherDone
 
 	if !quiet {
-		fmt.Printf("\r" + strings.Repeat(" ", 80) + "\r")
+		fmt.Print("\r" + strings.Repeat(" ", 80) + "\r")
 	}
 	return activeHosts
 }
@@ -751,11 +796,13 @@ func (s *Scanner) tcpDiscovery(ctx context.Context, ips []string) []string {
 	var mu sync.Mutex
 	discovered := make(map[string]bool)
 
-	// Use discovery timing for worker count.
+	// Use discovery timing for worker count, capped by the fd budget (each knock
+	// is a live socket).
 	discWorkers := (s.discTiming.MinParallelism + s.discTiming.MaxParallelism) / 2
 	if discWorkers < 10 {
 		discWorkers = 10
 	}
+	discWorkers = capConcurrency(discWorkers, s.fdLimit)
 
 	var wg sync.WaitGroup
 	jobs := make(chan scanJob, discWorkers*2)
@@ -808,14 +855,36 @@ func (s *Scanner) tcpDiscovery(ctx context.Context, ips []string) []string {
 	return activeHosts
 }
 
+// tcpProbe knocks a single port for host discovery. It reports the host as alive
+// on either a successful connect (SYN-ACK) or an actively refused connection
+// (RST) — both prove the host is up; the port being closed is irrelevant. A
+// timeout or unreachable error is treated as "no signal". Local fd exhaustion is
+// retried rather than counted as a negative.
 func (s *Scanner) tcpProbe(ctx context.Context, ip string, port int) bool {
-	d := net.Dialer{Timeout: 1000 * time.Millisecond}
-	conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", ip, port))
-	if err != nil {
+	addr := fmt.Sprintf("%s:%d", ip, port)
+	for res := 0; ; {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+		d := net.Dialer{Timeout: discoveryProbeTimeout}
+		conn, err := d.DialContext(ctx, "tcp", addr)
+		if err == nil {
+			conn.Close()
+			return true
+		}
+		if isRefused(err) {
+			return true // RST → host is alive
+		}
+		if isResourceError(err) && res < maxResourceRetries {
+			res++
+			atomic.AddInt64(&s.resourceErrors, 1)
+			time.Sleep(time.Duration(res) * 25 * time.Millisecond)
+			continue
+		}
 		return false
 	}
-	conn.Close()
-	return true
 }
 
 func (s *Scanner) scan(ctx context.Context, ips []string, ports []int, grabBanner bool) {
@@ -891,6 +960,8 @@ func (s *Scanner) scanPort(ctx context.Context, ip string, port int, grabBanner 
 	var err error
 	var lastErr error
 
+	addr := fmt.Sprintf("%s:%d", ip, port)
+	resourceRetries := 0
 	for attempt := 0; attempt <= s.retries; attempt++ {
 		select {
 		case <-ctx.Done():
@@ -900,7 +971,7 @@ func (s *Scanner) scanPort(ctx context.Context, ip string, port int, grabBanner 
 
 		d := net.Dialer{Timeout: timeout}
 		t0 := time.Now()
-		conn, err = d.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", ip, port))
+		conn, err = d.DialContext(ctx, "tcp", addr)
 		rtt := time.Since(t0)
 
 		if err == nil {
@@ -913,6 +984,16 @@ func (s *Scanner) scanPort(ctx context.Context, ip string, port int, grabBanner 
 			break
 		}
 		lastErr = err
+
+		// fd exhaustion says nothing about the port — back off and retry without
+		// spending the real retry budget, so an open port is never lost to EMFILE.
+		if isResourceError(err) && resourceRetries < maxResourceRetries {
+			resourceRetries++
+			atomic.AddInt64(&s.resourceErrors, 1)
+			time.Sleep(time.Duration(resourceRetries) * 25 * time.Millisecond)
+			attempt--
+			continue
+		}
 
 		if attempt < s.retries {
 			backoff := time.Duration(100*(attempt+1)) * time.Millisecond
@@ -963,6 +1044,53 @@ func isTimeoutError(err error) bool {
 		return netErr.Timeout()
 	}
 	return false
+}
+
+// isRefused reports whether a dial failed because the host actively refused the
+// connection (TCP RST). For host discovery this is a positive signal: the host
+// is alive and reachable, the probed port just happens to be closed.
+func isRefused(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED)
+}
+
+// isResourceError reports whether a dial failed due to local file-descriptor
+// exhaustion rather than anything about the target. Such a result says nothing
+// about whether the port is open, so it must never be classified as "closed".
+func isResourceError(err error) bool {
+	return errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE)
+}
+
+// raiseFDLimit best-effort raises the soft open-file limit to the hard limit and
+// returns the resulting soft limit. A connect() scanner needs one descriptor per
+// in-flight probe, so headroom here directly bounds achievable concurrency.
+func raiseFDLimit() uint64 {
+	var lim syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil {
+		return 1024 // conservative fallback
+	}
+	if lim.Cur < lim.Max {
+		lim.Cur = lim.Max
+		_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &lim)
+		// Re-read in case the kernel clamped the value.
+		_ = syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim)
+	}
+	return lim.Cur
+}
+
+// capConcurrency limits a desired worker count so that concurrent dials stay
+// under the available file-descriptor budget, leaving fdReserve for other use.
+func capConcurrency(desired int, fdLimit uint64) int {
+	budget := int(fdLimit) - fdReserve
+	if fdLimit > uint64(^uint(0)>>1) { // guard against overflow on huge limits
+		budget = int(^uint(0) >> 1)
+	}
+	if budget < 1 {
+		budget = 1
+	}
+	if desired > budget {
+		return budget
+	}
+	return desired
 }
 
 func (s *Scanner) calculateAvgRTT() time.Duration {
@@ -1223,6 +1351,9 @@ func (s *Scanner) printResults(duration time.Duration, quiet bool) {
 	fmt.Printf("[+] GoScan v%s done: %d ports in %.2fs (%.1f/s)\n", version, scanned, duration.Seconds(), rate)
 	fmt.Printf("[i] Hosts up: %d | Open: %d | Filtered: %d | Closed: %d\n",
 		hostsUp, openPorts, filteredPorts, scanned-openPorts-filteredPorts)
+	if re := atomic.LoadInt64(&s.resourceErrors); re > 0 {
+		fmt.Printf("[!] Recovered from %d file-descriptor exhaustion events (raise ulimit -n or lower -workers for headroom)\n", re)
+	}
 	fmt.Printf("========================================================\n")
 }
 
