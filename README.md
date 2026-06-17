@@ -50,8 +50,11 @@ GoScan -p 1-10000 -T4 192.168.1.0/24
 # Sparse /16: fast discovery, thorough port scan, JSON output
 GoScan -Td 5 -T 4 -sV -o scan -oF json 10.0.0.0/16
 
-# Diff two scans (flags BEFORE the file arguments)
-GoScan -oF json -diff scan-2026-06-16.json scan-2026-06-20.json
+# Diff two scans (flag order no longer matters)
+GoScan --diff scan-2026-06-16.json scan-2026-06-20.json -oF json
+
+# Resume an interrupted scan: skip already-completed hosts, finish the rest
+GoScan -p 1-65535 -resume scan-2026-06-17.json -o scan -oF json 10.0.0.0/16
 ```
 
 ### Key flags
@@ -67,6 +70,7 @@ GoScan -oF json -diff scan-2026-06-16.json scan-2026-06-20.json
 | `-o`    | Output file base name (date is auto-appended) |
 | `-oF`   | Output format: `json` (default), `txt`, `csv` |
 | `-diff` | Compare two JSON scan files |
+| `-resume` | Resume from a prior JSON scan: skip already-completed hosts, merge their results |
 
 ### Exit codes
 
@@ -107,9 +111,19 @@ GoScan -oF json -o /data/diffs/diff \
 - **Change-detection stability:** discovery gathers signal from both ICMP and a multi-port,
   RST-aware TCP knock, so a single dropped packet is unlikely to flip a live host to "down"
   and create spurious `NEW_HOST`/`CLOSED_HOST` churn in diffs.
+- **Per-host adaptive timing:** each host gets its own smoothed RTT and timeout (Jacobson/Karels,
+  as TCP computes its RTO) plus a congestion backoff that grows the timeout on consecutive
+  losses — so a slow WAN host and a fast LAN host no longer share, and corrupt, one global
+  timeout. This is what keeps results accurate on a lossy or rate-limited link.
+- **Resume:** every host is tagged `complete` in JSON output; `-resume <file>` skips hosts
+  already fully scanned and finishes the rest, so a /16 that dies at 90% continues cheaply
+  instead of restarting from zero.
+- **Diff guards:** `--diff` warns when the two scans cover different targets, or when either is
+  marked partial (so a consumer never treats an interrupted scan's absences as real closures).
 
-Both nmap-style attached flags (`-T4`, `-Td5`, `-p-`) and space-separated forms (`-T 4`,
-`-p 1-65535`) are accepted.
+Argument handling is forgiving: nmap-style attached flags (`-T4`, `-Td5`, `-p-`) and
+space-separated forms (`-T 4`, `-p 1-65535`) both work, and flags may appear before or after
+positional arguments.
 
 ## Privileges
 

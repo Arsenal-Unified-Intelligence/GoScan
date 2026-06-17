@@ -26,7 +26,7 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
-const version = "1.2"
+const version = "1.3"
 
 const (
 	defaultTimeout = 2 * time.Second
@@ -216,8 +216,11 @@ type Scanner struct {
 	probePanics       int64
 	partial           int32 // set when the scan did not complete (interrupted)
 	lastHostScan   sync.Map
-	rttSamples     []time.Duration
-	rttMu          sync.Mutex
+	hostTimings    sync.Map // ip -> *hostTiming (per-host adaptive timeout)
+	globalSRTT     int64    // atomic nanos; coarse EWMA for progress display only
+	hostProgress   sync.Map // ip -> *int64 count of ports attempted (for resume/completion)
+	totalPorts     int      // ports per host this run (for completion detection)
+	resumeSkip     map[string]bool // hosts seeded from --resume; skip scanning
 	progressTicker *time.Ticker
 	startTime      time.Time
 
@@ -227,6 +230,18 @@ type Scanner struct {
 	isatty       bool
 
 	fdLimit uint64 // soft open-file limit, used to cap discovery concurrency
+}
+
+// hostTiming holds per-host adaptive timeout state: a smoothed RTT and variance
+// (Jacobson/Karels, as TCP computes its RTO) plus a congestion counter that grows
+// the timeout on consecutive losses. Per-host means a slow WAN host and a fast LAN
+// host no longer share — and corrupt — one global timeout.
+type hostTiming struct {
+	mu       sync.Mutex
+	srtt     time.Duration
+	rttvar   time.Duration
+	hasRTT   bool
+	timeouts int // consecutive timeouts (congestion signal)
 }
 
 // icmpResponse / icmpRequest used by the centralized ICMP dispatcher.
@@ -288,6 +303,41 @@ func normalizeArgs(args []string) []string {
 	return out
 }
 
+// valueFlags are the flags that consume a following argument as their value.
+// Used by reorderArgs to permute flags ahead of positionals.
+var valueFlags = map[string]bool{
+	"p": true, "o": true, "workers": true, "timeout": true, "retries": true,
+	"T": true, "Td": true, "oF": true, "diff": true, "diff2": true, "resume": true,
+}
+
+// reorderArgs moves flags (and their values) ahead of positional arguments so that
+// invocations like "--diff a.json b.json -oF json -o out" work — Go's flag package
+// otherwise stops parsing at the first positional, silently dropping trailing flags.
+func reorderArgs(args []string) []string {
+	var flags, positionals []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" { // explicit end-of-flags: everything after is positional
+			positionals = append(positionals, args[i+1:]...)
+			break
+		}
+		if strings.HasPrefix(a, "-") && a != "-" {
+			flags = append(flags, a)
+			// "-flag=value" carries its own value; bare value-flags consume the next arg.
+			if !strings.Contains(a, "=") {
+				name := strings.TrimLeft(a, "-")
+				if valueFlags[name] && i+1 < len(args) {
+					flags = append(flags, args[i+1])
+					i++
+				}
+			}
+			continue
+		}
+		positionals = append(positionals, a)
+	}
+	return append(flags, positionals...)
+}
+
 func main() {
 	ports := flag.String("p", "", "Port specification (22,80,443 | 1-1000 | - for all ports, default: top 100)")
 	output := flag.String("o", "", "Output file base name (date auto-appended, e.g. goscan → goscan-2026-06-17)")
@@ -305,6 +355,7 @@ func main() {
 	showFiltered := flag.Bool("sF", false, "Report filtered (firewalled) ports in addition to open")
 	diffFile1 := flag.String("diff", "", "Compare two JSON scan files: --diff scan1.json scan2.json")
 	diffFile2 := flag.String("diff2", "", "Second file for diff comparison")
+	resumeFile := flag.String("resume", "", "Resume from a prior JSON scan: skip already-completed hosts, merge their results")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "GoScan v%s - Fast & Smart Network Scanner\n\n", version)
@@ -320,9 +371,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s -p 1-10000 -T4 192.168.1.0/24\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -Td 5 -T 4 -sV -o scan 10.0.0.0/16   # fast discovery, thorough scan\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s --diff scan-2026-06-16.json scan-2026-06-20.json\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -resume scan-2026-06-17.json -o scan 10.0.0.0/16   # finish an interrupted scan\n", os.Args[0])
 	}
 
-	flag.CommandLine.Parse(normalizeArgs(os.Args[1:]))
+	flag.CommandLine.Parse(reorderArgs(normalizeArgs(os.Args[1:])))
 
 	// Diff mode — no target required.
 	if *diffFile1 != "" {
@@ -434,7 +486,6 @@ func main() {
 		target:       target,
 		portsDesc:    portsDesc,
 		hostInfo:     make(map[string]*HostInfo),
-		rttSamples:   make([]time.Duration, 0, 100),
 		startTime:    time.Now(),
 		outputFile:   outFile,
 		outputFormat: *outputFormat,
@@ -461,6 +512,22 @@ func main() {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[!] Error parsing ports: %v\n", err)
 			os.Exit(1)
+		}
+	}
+	scanner.totalPorts = len(portList)
+
+	// Resume: seed already-completed hosts from a prior scan and skip them.
+	if *resumeFile != "" {
+		skip, rerr := scanner.loadResume(*resumeFile)
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "[!] Error loading resume file %s: %v\n", *resumeFile, rerr)
+			os.Exit(1)
+		}
+		scanner.resumeSkip = skip
+		if !quietMode {
+			fmt.Printf("[>] Resume: %d hosts already complete in %s — skipping their port scan\n", len(skip), *resumeFile)
+		} else {
+			fmt.Printf("[+] Resume: skipping %d completed hosts\n", len(skip))
 		}
 	}
 
@@ -517,7 +584,7 @@ func main() {
 		scanner.hostInfo[ips[0]] = &HostInfo{IP: ips[0], IsUp: true, Method: "single"}
 	}
 
-	if len(activeHosts) == 0 {
+	if len(activeHosts) == 0 && len(scanner.resumeSkip) == 0 {
 		fmt.Printf("[!] No hosts found up. Exiting.\n")
 		os.Exit(0)
 	}
@@ -973,6 +1040,9 @@ func (s *Scanner) scan(ctx context.Context, ips []string, ports []int, grabBanne
 	go func() {
 		defer close(jobs)
 		for _, ip := range ips {
+			if s.resumeSkip[ip] {
+				continue // already fully scanned in the --resume file
+			}
 			for _, port := range ports {
 				select {
 				case jobs <- scanJob{ip: ip, port: port}:
@@ -1006,6 +1076,16 @@ func (s *Scanner) runScanJob(ctx context.Context, job scanJob, grabBanner bool) 
 		}
 	}
 	s.scanPort(ctx, job.ip, job.port, grabBanner)
+
+	// Only count the attempt if we weren't interrupted, so an interrupted host
+	// stays "incomplete" and a later --resume rescans it rather than trusting
+	// its partial port data.
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
+	s.incHostProgress(job.ip)
 	s.lastHostScan.Store(job.ip, time.Now())
 	if s.timing.ScanDelay > 0 {
 		time.Sleep(s.timing.ScanDelay)
@@ -1015,20 +1095,7 @@ func (s *Scanner) runScanJob(ctx context.Context, job scanJob, grabBanner bool) 
 func (s *Scanner) scanPort(ctx context.Context, ip string, port int, grabBanner bool) {
 	defer atomic.AddInt64(&s.scanned, 1)
 
-	timeout := s.timeout
-	if s.aggressive {
-		timeout = timeout / 2
-	}
-
-	s.rttMu.Lock()
-	if len(s.rttSamples) > 10 {
-		avgRTT := s.calculateAvgRTT()
-		adaptive := avgRTT * 3
-		if adaptive > s.timing.MinRTT && adaptive < s.timing.MaxRTT {
-			timeout = adaptive
-		}
-	}
-	s.rttMu.Unlock()
+	timeout := s.hostTimeout(ip)
 
 	var conn net.Conn
 	var err error
@@ -1049,12 +1116,7 @@ func (s *Scanner) scanPort(ctx context.Context, ip string, port int, grabBanner 
 		rtt := time.Since(t0)
 
 		if err == nil {
-			s.rttMu.Lock()
-			s.rttSamples = append(s.rttSamples, rtt)
-			if len(s.rttSamples) > 100 {
-				s.rttSamples = s.rttSamples[1:]
-			}
-			s.rttMu.Unlock()
+			s.recordRTT(ip, rtt)
 			break
 		}
 		lastErr = err
@@ -1086,12 +1148,16 @@ func (s *Scanner) scanPort(ctx context.Context, ip string, port int, grabBanner 
 			// Host/network unreachable says nothing about the port — do not count
 			// it as a confident "closed" (which would manufacture diff churn).
 			atomic.AddInt64(&s.unreachableErrors, 1)
-		case s.showFiltered && isTimeoutError(lastErr):
-			result := ScanResult{IP: ip, Port: port, State: stateFiltered}
-			s.mu.Lock()
-			s.results = append(s.results, result)
-			s.mu.Unlock()
-			atomic.AddInt64(&s.filteredPorts, 1)
+		case isTimeoutError(lastErr):
+			// Congestion signal: grow this host's next timeout.
+			s.recordTimeout(ip)
+			if s.showFiltered {
+				result := ScanResult{IP: ip, Port: port, State: stateFiltered}
+				s.mu.Lock()
+				s.results = append(s.results, result)
+				s.mu.Unlock()
+				atomic.AddInt64(&s.filteredPorts, 1)
+			}
 		}
 		// Otherwise the host actively refused (RST) → genuinely closed; not stored.
 		return
@@ -1209,15 +1275,147 @@ func capConcurrency(desired int, fdLimit uint64) int {
 	return desired
 }
 
-func (s *Scanner) calculateAvgRTT() time.Duration {
-	if len(s.rttSamples) == 0 {
-		return s.timing.InitialRTT
+// displayRTT returns a coarse global smoothed RTT for the progress line only.
+func (s *Scanner) displayRTT() time.Duration {
+	if v := atomic.LoadInt64(&s.globalSRTT); v > 0 {
+		return time.Duration(v)
 	}
-	var total time.Duration
-	for _, rtt := range s.rttSamples {
-		total += rtt
+	return s.timing.InitialRTT
+}
+
+func (s *Scanner) htFor(ip string) *hostTiming {
+	if v, ok := s.hostTimings.Load(ip); ok {
+		return v.(*hostTiming)
 	}
-	return total / time.Duration(len(s.rttSamples))
+	actual, _ := s.hostTimings.LoadOrStore(ip, &hostTiming{})
+	return actual.(*hostTiming)
+}
+
+// hostTimeout returns the adaptive connect timeout for a host: an RTO derived from
+// its smoothed RTT (srtt + 4·rttvar), doubled per consecutive timeout as congestion
+// backoff, clamped to the timing template's [MinRTT, MaxRTT]. Before any RTT sample
+// exists it falls back to the base timeout (also backed off under congestion).
+func (s *Scanner) hostTimeout(ip string) time.Duration {
+	base := s.timeout
+	if s.aggressive {
+		base /= 2
+	}
+	ht := s.htFor(ip)
+	ht.mu.Lock()
+	defer ht.mu.Unlock()
+
+	to := base
+	if ht.hasRTT {
+		to = ht.srtt + 4*ht.rttvar
+	}
+	if ht.timeouts > 0 {
+		shift := ht.timeouts
+		if shift > 4 {
+			shift = 4
+		}
+		to <<= uint(shift)
+	}
+	if to < s.timing.MinRTT {
+		to = s.timing.MinRTT
+	}
+	if to > s.timing.MaxRTT {
+		to = s.timing.MaxRTT
+	}
+	if to <= 0 {
+		to = base
+	}
+	return to
+}
+
+// recordRTT folds a successful RTT into the host's smoothed estimate (Jacobson/
+// Karels) and clears its congestion counter.
+func (s *Scanner) recordRTT(ip string, rtt time.Duration) {
+	ht := s.htFor(ip)
+	ht.mu.Lock()
+	if !ht.hasRTT {
+		ht.srtt = rtt
+		ht.rttvar = rtt / 2
+		ht.hasRTT = true
+	} else {
+		diff := ht.srtt - rtt
+		if diff < 0 {
+			diff = -diff
+		}
+		ht.rttvar = (3*ht.rttvar + diff) / 4
+		ht.srtt = (7*ht.srtt + rtt) / 8
+	}
+	ht.timeouts = 0
+	ht.mu.Unlock()
+
+	// Coarse global EWMA for the progress display (approximate; display-only).
+	old := atomic.LoadInt64(&s.globalSRTT)
+	if old == 0 {
+		atomic.StoreInt64(&s.globalSRTT, int64(rtt))
+	} else {
+		atomic.StoreInt64(&s.globalSRTT, (7*old+int64(rtt))/8)
+	}
+}
+
+// recordTimeout signals a congestion event for a host (grows its next timeout).
+func (s *Scanner) recordTimeout(ip string) {
+	ht := s.htFor(ip)
+	ht.mu.Lock()
+	ht.timeouts++
+	ht.mu.Unlock()
+}
+
+// incHostProgress records that one more port of a host has been attempted.
+func (s *Scanner) incHostProgress(ip string) {
+	v, _ := s.hostProgress.LoadOrStore(ip, new(int64))
+	atomic.AddInt64(v.(*int64), 1)
+}
+
+// hostComplete reports whether every port of a host has been attempted this run,
+// i.e. the host's results are authoritative (used for --resume and JSON output).
+func (s *Scanner) hostComplete(ip string) bool {
+	if s.totalPorts <= 0 {
+		return false
+	}
+	if v, ok := s.hostProgress.Load(ip); ok {
+		return atomic.LoadInt64(v.(*int64)) >= int64(s.totalPorts)
+	}
+	return false
+}
+
+// markHostComplete forces a host to count as fully scanned (used when seeding
+// already-finished hosts from a --resume file).
+func (s *Scanner) markHostComplete(ip string) {
+	c := new(int64)
+	*c = int64(s.totalPorts)
+	s.hostProgress.Store(ip, c)
+}
+
+// loadResume seeds results from a prior scan's fully-completed hosts so they are
+// skipped this run and merged into output. Hosts marked incomplete in the prior
+// file are ignored (rescanned fresh). Returns the set of host IPs to skip.
+func (s *Scanner) loadResume(path string) (map[string]bool, error) {
+	prev, err := loadJSONScan(path)
+	if err != nil {
+		return nil, err
+	}
+	skip := make(map[string]bool)
+	for _, h := range prev.Hosts {
+		if !h.Complete {
+			continue
+		}
+		s.mu.Lock()
+		s.hostInfo[h.IP] = &HostInfo{IP: h.IP, IsUp: true, Method: h.Method}
+		for _, p := range h.Ports {
+			s.results = append(s.results, ScanResult{IP: h.IP, Port: p.Port, State: p.State, Banner: p.Service})
+			if p.State == stateOpen {
+				atomic.AddInt64(&s.openPorts, 1)
+			}
+		}
+		s.mu.Unlock()
+		s.markHostComplete(h.IP)
+		skip[h.IP] = true
+	}
+	return skip, nil
 }
 
 func (s *Scanner) grabBanner(conn net.Conn, port int) string {
@@ -1444,7 +1642,7 @@ func ipToUint32(ipStr string) uint32 {
 func printBanner(scanTiming, discTiming string, workers int, timeout time.Duration, retries int) {
 	fmt.Printf("%s\n", asciiArt)
 	fmt.Printf("           Fast & Smart Network Scanner v%s\n", version)
-	fmt.Printf("           https://github.com/RedLogicSecurity/GoScan\n")
+	fmt.Printf("           https://github.com/Arsenal-Unified-Intelligence/GoScan\n")
 	fmt.Printf("========================================================\n")
 	fmt.Printf("[i]  Scan Timing:  %s\n", scanTiming)
 	fmt.Printf("[i]  Disc Timing:  %s\n", discTiming)
@@ -1463,9 +1661,7 @@ func (s *Scanner) showProgress(ctx context.Context) {
 			filtered := atomic.LoadInt64(&s.filteredPorts)
 			elapsed := time.Since(s.startTime)
 			rate := float64(scanned) / elapsed.Seconds()
-			s.rttMu.Lock()
-			avgRTT := s.calculateAvgRTT()
-			s.rttMu.Unlock()
+			avgRTT := s.displayRTT()
 			closed := scanned - open - filtered
 			fmt.Printf("\r[*] Scanned: %d | Open: %d | Filtered: %d | Closed: %d | Rate: %.1f/s | RTT: %v | Elapsed: %v",
 				scanned, open, filtered, closed, rate, avgRTT.Round(time.Millisecond), elapsed.Round(time.Second))
@@ -1597,6 +1793,7 @@ type JSONHost struct {
 	IP          string     `json:"ip"`
 	Method      string     `json:"discovery_method,omitempty"`
 	Fingerprint string     `json:"fingerprint"`
+	Complete    bool       `json:"complete"` // false if this host wasn't fully scanned (interrupted); enables --resume
 	Ports       []JSONPort `json:"ports"`
 }
 
@@ -1647,6 +1844,7 @@ func (s *Scanner) saveResultsJSON(filename string, duration time.Duration) error
 			IP:          ip,
 			Method:      method,
 			Fingerprint: hostFingerprint(results),
+			Complete:    s.hostComplete(ip),
 			Ports:       ports,
 		})
 	}
@@ -1839,6 +2037,17 @@ func runDiff(file1, file2, outputFormat, outFile string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[!] Error loading %s: %v\n", file2, err)
 		return 1
+	}
+
+	// Self-consistency guards: a mismatched target or a partial scan produces
+	// misleading diffs (spurious new/closed hosts and ports). Warn loudly so a
+	// downstream consumer doesn't act on noise.
+	if scan1.Meta.Target != "" && scan2.Meta.Target != "" && scan1.Meta.Target != scan2.Meta.Target {
+		fmt.Fprintf(os.Stderr, "[!] Warning: scans cover different targets (%s vs %s) — diff may be meaningless\n",
+			scan1.Meta.Target, scan2.Meta.Target)
+	}
+	if scan1.Meta.Partial || scan2.Meta.Partial {
+		fmt.Fprintf(os.Stderr, "[!] Warning: a scan is marked partial (interrupted) — absent ports are not confirmed closed; CLOSED_* changes may be false\n")
 	}
 
 	// Index hosts by IP.
