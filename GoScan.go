@@ -9,9 +9,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -206,10 +208,13 @@ type Scanner struct {
 	mu             sync.Mutex
 	results        []ScanResult
 	hostInfo       map[string]*HostInfo
-	scanned        int64
-	openPorts      int64
-	filteredPorts  int64
-	resourceErrors int64
+	scanned           int64
+	openPorts         int64
+	filteredPorts     int64
+	resourceErrors    int64
+	unreachableErrors int64
+	probePanics       int64
+	partial           int32 // set when the scan did not complete (interrupted)
 	lastHostScan   sync.Map
 	rttSamples     []time.Duration
 	rttMu          sync.Mutex
@@ -238,6 +243,49 @@ func isTTY() bool {
 		return false
 	}
 	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+// normalizeArgs rewrites nmap-style attached short flags into the space-separated
+// form Go's flag package requires, so familiar invocations like "-T4", "-Td5", and
+// "-p-" work as documented (Go's flag would otherwise reject them as unknown flags).
+func normalizeArgs(args []string) []string {
+	isPortSpec := func(s string) bool {
+		if s == "" {
+			return false
+		}
+		for _, r := range s {
+			if !(r >= '0' && r <= '9') && r != ',' && r != '-' {
+				return false
+			}
+		}
+		return true
+	}
+	isDigits := func(s string) bool {
+		if s == "" {
+			return false
+		}
+		for _, r := range s {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+		return true
+	}
+
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		switch {
+		case strings.HasPrefix(a, "-Td") && isDigits(a[3:]):
+			out = append(out, "-Td", a[3:])
+		case strings.HasPrefix(a, "-T") && isDigits(a[2:]):
+			out = append(out, "-T", a[2:])
+		case strings.HasPrefix(a, "-p") && len(a) > 2 && isPortSpec(a[2:]):
+			out = append(out, "-p", a[2:])
+		default:
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 func main() {
@@ -274,7 +322,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s --diff scan-2026-06-16.json scan-2026-06-20.json\n", os.Args[0])
 	}
 
-	flag.Parse()
+	flag.CommandLine.Parse(normalizeArgs(os.Args[1:]))
 
 	// Diff mode — no target required.
 	if *diffFile1 != "" {
@@ -425,6 +473,7 @@ func main() {
 	go func() {
 		<-sigChan
 		fmt.Printf("\n\n[!] Scan interrupted — saving partial results...\n")
+		atomic.StoreInt32(&scanner.partial, 1)
 		cancel()
 		if scanner.progressTicker != nil {
 			scanner.progressTicker.Stop()
@@ -823,7 +872,7 @@ func (s *Scanner) tcpDiscovery(ctx context.Context, ips []string) []string {
 					if alreadyFound {
 						continue
 					}
-					if s.tcpProbe(ctx, job.ip, job.port) {
+					if s.tcpProbeSafe(ctx, job.ip, job.port) {
 						mu.Lock()
 						if !discovered[job.ip] {
 							discovered[job.ip] = true
@@ -853,6 +902,18 @@ func (s *Scanner) tcpDiscovery(ctx context.Context, ips []string) []string {
 
 	wg.Wait()
 	return activeHosts
+}
+
+// tcpProbeSafe wraps tcpProbe with panic recovery so a malformed response during
+// discovery can never take down a discovery worker.
+func (s *Scanner) tcpProbeSafe(ctx context.Context, ip string, port int) (up bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			atomic.AddInt64(&s.probePanics, 1)
+			up = false
+		}
+	}()
+	return s.tcpProbe(ctx, ip, port)
 }
 
 // tcpProbe knocks a single port for host discovery. It reports the host as alive
@@ -901,20 +962,7 @@ func (s *Scanner) scan(ctx context.Context, ips []string, ports []int, grabBanne
 					if !ok {
 						return
 					}
-					if s.timing.PerHostRateLimit > 0 {
-						if lastScan, ok := s.lastHostScan.Load(job.ip); ok {
-							if lastTime, ok := lastScan.(time.Time); ok {
-								if elapsed := time.Since(lastTime); elapsed < s.timing.PerHostRateLimit {
-									time.Sleep(s.timing.PerHostRateLimit - elapsed)
-								}
-							}
-						}
-					}
-					s.scanPort(ctx, job.ip, job.port, grabBanner)
-					s.lastHostScan.Store(job.ip, time.Now())
-					if s.timing.ScanDelay > 0 {
-						time.Sleep(s.timing.ScanDelay)
-					}
+					s.runScanJob(ctx, job, grabBanner)
 				case <-ctx.Done():
 					return
 				}
@@ -936,6 +984,32 @@ func (s *Scanner) scan(ctx context.Context, ips []string, ports []int, grabBanne
 	}()
 
 	wg.Wait()
+}
+
+// runScanJob applies per-host rate limiting and scans one port, recovering from
+// any panic so a single malformed response can never abort the whole scan — the
+// resilience property that lets a multi-hour /16 run to completion.
+func (s *Scanner) runScanJob(ctx context.Context, job scanJob, grabBanner bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			atomic.AddInt64(&s.probePanics, 1)
+		}
+	}()
+
+	if s.timing.PerHostRateLimit > 0 {
+		if lastScan, ok := s.lastHostScan.Load(job.ip); ok {
+			if lastTime, ok := lastScan.(time.Time); ok {
+				if elapsed := time.Since(lastTime); elapsed < s.timing.PerHostRateLimit {
+					time.Sleep(s.timing.PerHostRateLimit - elapsed)
+				}
+			}
+		}
+	}
+	s.scanPort(ctx, job.ip, job.port, grabBanner)
+	s.lastHostScan.Store(job.ip, time.Now())
+	if s.timing.ScanDelay > 0 {
+		time.Sleep(s.timing.ScanDelay)
+	}
 }
 
 func (s *Scanner) scanPort(ctx context.Context, ip string, port int, grabBanner bool) {
@@ -1007,14 +1081,19 @@ func (s *Scanner) scanPort(ctx context.Context, ip string, port int, grabBanner 
 	}
 
 	if err != nil {
-		// Distinguish filtered (timeout) from closed (connection refused).
-		if s.showFiltered && isTimeoutError(lastErr) {
+		switch {
+		case isUnreachable(lastErr):
+			// Host/network unreachable says nothing about the port — do not count
+			// it as a confident "closed" (which would manufacture diff churn).
+			atomic.AddInt64(&s.unreachableErrors, 1)
+		case s.showFiltered && isTimeoutError(lastErr):
 			result := ScanResult{IP: ip, Port: port, State: stateFiltered}
 			s.mu.Lock()
 			s.results = append(s.results, result)
 			s.mu.Unlock()
 			atomic.AddInt64(&s.filteredPorts, 1)
 		}
+		// Otherwise the host actively refused (RST) → genuinely closed; not stored.
 		return
 	}
 	defer conn.Close()
@@ -1058,6 +1137,43 @@ func isRefused(err error) bool {
 // about whether the port is open, so it must never be classified as "closed".
 func isResourceError(err error) bool {
 	return errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE)
+}
+
+// isUnreachable reports whether a dial failed because the host or network could
+// not be reached (routing/connectivity), as opposed to the host actively saying
+// the port is closed (RST). Unreachable says nothing about the port, so it must
+// not be counted as a confident "closed".
+func isUnreachable(err error) bool {
+	return errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.ENETDOWN) ||
+		errors.Is(err, syscall.EHOSTDOWN)
+}
+
+// writeFileAtomic writes through a temp file in the same directory, fsyncs it, and
+// renames it into place. A concurrent reader (the AI agent) therefore always sees
+// either the previous complete file or the new complete file — never a torn one —
+// and an interrupted write leaves the prior good file intact.
+func writeFileAtomic(path string, write func(io.Writer) error) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once the rename succeeds
+	if err := write(tmp); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // raiseFDLimit best-effort raises the soft open-file limit to the hard limit and
@@ -1418,14 +1534,25 @@ func (s *Scanner) printResults(duration time.Duration, quiet bool) {
 	scanned := atomic.LoadInt64(&s.scanned)
 	openPorts := atomic.LoadInt64(&s.openPorts)
 	filteredPorts := atomic.LoadInt64(&s.filteredPorts)
+	unreachable := atomic.LoadInt64(&s.unreachableErrors)
 	rate := float64(scanned) / duration.Seconds()
+	closed := scanned - openPorts - filteredPorts - unreachable
+	if closed < 0 {
+		closed = 0
+	}
 
 	fmt.Printf("========================================================\n")
 	fmt.Printf("[+] GoScan v%s done: %d ports in %.2fs (%.1f/s)\n", version, scanned, duration.Seconds(), rate)
-	fmt.Printf("[i] Hosts up: %d | Open: %d | Filtered: %d | Closed: %d\n",
-		hostsUp, openPorts, filteredPorts, scanned-openPorts-filteredPorts)
+	fmt.Printf("[i] Hosts up: %d | Open: %d | Filtered: %d | Closed: %d | Unreachable: %d\n",
+		hostsUp, openPorts, filteredPorts, closed, unreachable)
 	if re := atomic.LoadInt64(&s.resourceErrors); re > 0 {
 		fmt.Printf("[!] Recovered from %d file-descriptor exhaustion events (raise ulimit -n or lower -workers for headroom)\n", re)
+	}
+	if pp := atomic.LoadInt64(&s.probePanics); pp > 0 {
+		fmt.Printf("[!] Recovered from %d probe panics (scan continued; affected ports skipped)\n", pp)
+	}
+	if atomic.LoadInt32(&s.partial) != 0 {
+		fmt.Printf("[!] Scan was interrupted — results are PARTIAL (absent ports are not confirmed closed)\n")
 	}
 	fmt.Printf("========================================================\n")
 }
@@ -1456,6 +1583,8 @@ type JSONScanMeta struct {
 	HostsDiscovered int   `json:"hosts_discovered"`
 	TotalOpenPorts int64  `json:"total_open_ports"`
 	TotalFiltered  int64  `json:"total_filtered_ports"`
+	TotalUnreachable int64 `json:"total_unreachable"`
+	Partial        bool   `json:"partial"` // true if the scan was interrupted; port absences are not authoritative
 }
 
 type JSONPort struct {
@@ -1535,30 +1664,23 @@ func (s *Scanner) saveResultsJSON(filename string, duration time.Duration) error
 			PortsScanned:    s.portsDesc,
 			GoScanVersion:   version,
 			DurationSecs:    int64(duration.Seconds()),
-			HostsDiscovered: hostsUp,
-			TotalOpenPorts:  atomic.LoadInt64(&s.openPorts),
-			TotalFiltered:   atomic.LoadInt64(&s.filteredPorts),
+			HostsDiscovered:  hostsUp,
+			TotalOpenPorts:   atomic.LoadInt64(&s.openPorts),
+			TotalFiltered:    atomic.LoadInt64(&s.filteredPorts),
+			TotalUnreachable: atomic.LoadInt64(&s.unreachableErrors),
+			Partial:          atomic.LoadInt32(&s.partial) != 0,
 		},
 		Hosts: hosts,
 	}
 
-	f, err := os.Create(filename)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	return enc.Encode(output)
+	return writeFileAtomic(filename, func(w io.Writer) error {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(output)
+	})
 }
 
 func (s *Scanner) saveResultsTXT(filename string) error {
-	f, err := os.Create(filename)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
 	ipMap := make(map[string][]ScanResult)
 	for _, r := range s.results {
 		ipMap[r.IP] = append(ipMap[r.IP], r)
@@ -1572,55 +1694,48 @@ func (s *Scanner) saveResultsTXT(filename string) error {
 	s.mu.Unlock()
 	sortIPsNumerically(ips)
 
-	fmt.Fprintf(f, "# GoScan v%s Results\n", version)
-	fmt.Fprintf(f, "# Target: %s\n", s.target)
-	fmt.Fprintf(f, "# Scan Date: %s\n\n", time.Now().Format(time.RFC3339))
-
-	for _, ip := range ips {
-		results := ipMap[ip]
-		sort.Slice(results, func(i, j int) bool { return results[i].Port < results[j].Port })
-
-		s.mu.Lock()
-		hInfo := s.hostInfo[ip]
-		s.mu.Unlock()
-
-		fmt.Fprintf(f, "Host: %s", ip)
-		if hInfo != nil && hInfo.Method != "" {
-			fmt.Fprintf(f, " [%s]", hInfo.Method)
+	return writeFileAtomic(filename, func(f io.Writer) error {
+		fmt.Fprintf(f, "# GoScan v%s Results\n", version)
+		fmt.Fprintf(f, "# Target: %s\n", s.target)
+		fmt.Fprintf(f, "# Scan Date: %s\n", time.Now().Format(time.RFC3339))
+		if atomic.LoadInt32(&s.partial) != 0 {
+			fmt.Fprintf(f, "# PARTIAL: scan was interrupted; absent ports are not confirmed closed\n")
 		}
 		fmt.Fprintln(f)
 
-		if len(results) == 0 {
-			fmt.Fprintln(f, "  (no open ports detected)")
-		} else {
-			fmt.Fprintf(f, "  %-9s %-10s %s\n", "PORT", "STATE", "SERVICE")
-			for _, r := range results {
-				svc := r.Banner
-				if svc == "" {
-					svc = "unknown"
-				}
-				fmt.Fprintf(f, "  %-9d %-10s %s\n", r.Port, r.State, svc)
+		for _, ip := range ips {
+			results := ipMap[ip]
+			sort.Slice(results, func(i, j int) bool { return results[i].Port < results[j].Port })
+
+			s.mu.Lock()
+			hInfo := s.hostInfo[ip]
+			s.mu.Unlock()
+
+			fmt.Fprintf(f, "Host: %s", ip)
+			if hInfo != nil && hInfo.Method != "" {
+				fmt.Fprintf(f, " [%s]", hInfo.Method)
 			}
+			fmt.Fprintln(f)
+
+			if len(results) == 0 {
+				fmt.Fprintln(f, "  (no open ports detected)")
+			} else {
+				fmt.Fprintf(f, "  %-9s %-10s %s\n", "PORT", "STATE", "SERVICE")
+				for _, r := range results {
+					svc := r.Banner
+					if svc == "" {
+						svc = "unknown"
+					}
+					fmt.Fprintf(f, "  %-9d %-10s %s\n", r.Port, r.State, svc)
+				}
+			}
+			fmt.Fprintln(f)
 		}
-		fmt.Fprintln(f)
-	}
-	return nil
+		return nil
+	})
 }
 
 func (s *Scanner) saveResultsCSV(filename string) error {
-	f, err := os.Create(filename)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	w := csv.NewWriter(f)
-	defer w.Flush()
-
-	if err := w.Write([]string{"IP", "Port", "State", "Service", "Discovery Method", "Fingerprint"}); err != nil {
-		return err
-	}
-
 	ipMap := make(map[string][]ScanResult)
 	for _, r := range s.results {
 		ipMap[r.IP] = append(ipMap[r.IP], r)
@@ -1634,37 +1749,45 @@ func (s *Scanner) saveResultsCSV(filename string) error {
 	s.mu.Unlock()
 	sortIPsNumerically(ips)
 
-	for _, ip := range ips {
-		results := ipMap[ip]
-		sort.Slice(results, func(i, j int) bool { return results[i].Port < results[j].Port })
-
-		s.mu.Lock()
-		hInfo := s.hostInfo[ip]
-		s.mu.Unlock()
-
-		method := ""
-		if hInfo != nil {
-			method = hInfo.Method
+	return writeFileAtomic(filename, func(out io.Writer) error {
+		w := csv.NewWriter(out)
+		if err := w.Write([]string{"IP", "Port", "State", "Service", "Discovery Method", "Fingerprint"}); err != nil {
+			return err
 		}
-		fp := hostFingerprint(results)
 
-		if len(results) == 0 {
-			if err := w.Write([]string{ip, "-", "up", "no open ports", method, fp}); err != nil {
-				return err
+		for _, ip := range ips {
+			results := ipMap[ip]
+			sort.Slice(results, func(i, j int) bool { return results[i].Port < results[j].Port })
+
+			s.mu.Lock()
+			hInfo := s.hostInfo[ip]
+			s.mu.Unlock()
+
+			method := ""
+			if hInfo != nil {
+				method = hInfo.Method
 			}
-		} else {
-			for _, r := range results {
-				svc := r.Banner
-				if svc == "" {
-					svc = "unknown"
-				}
-				if err := w.Write([]string{ip, strconv.Itoa(r.Port), r.State, svc, method, fp}); err != nil {
+			fp := hostFingerprint(results)
+
+			if len(results) == 0 {
+				if err := w.Write([]string{ip, "-", "up", "no open ports", method, fp}); err != nil {
 					return err
 				}
+			} else {
+				for _, r := range results {
+					svc := r.Banner
+					if svc == "" {
+						svc = "unknown"
+					}
+					if err := w.Write([]string{ip, strconv.Itoa(r.Port), r.State, svc, method, fp}); err != nil {
+						return err
+					}
+				}
 			}
 		}
-	}
-	return nil
+		w.Flush()
+		return w.Error()
+	})
 }
 
 // ── Diff mode ─────────────────────────────────────────────────────────────────
@@ -1821,7 +1944,11 @@ func runDiff(file1, file2, outputFormat, outFile string) int {
 			return 1
 		}
 		if outFile != "" {
-			if writeErr := os.WriteFile(outFile, out, 0644); writeErr != nil {
+			writeErr := writeFileAtomic(outFile, func(w io.Writer) error {
+				_, e := w.Write(out)
+				return e
+			})
+			if writeErr != nil {
 				fmt.Fprintf(os.Stderr, "[!] Error writing diff to %s: %v\n", outFile, writeErr)
 				return 1
 			}

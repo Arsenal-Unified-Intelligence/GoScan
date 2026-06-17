@@ -90,6 +90,16 @@ GoScan -oF json -o /data/diffs/diff \
 
 ## Reliability notes
 
+- **Atomic output:** results are written to a temp file, fsynced, and renamed into place, so a
+  reader (your AI agent) never sees a half-written file, and an interrupted write leaves the
+  previous good file intact.
+- **Crash resistance:** each probe runs under panic recovery — one malformed response can never
+  abort a multi-hour scan; the affected port is skipped and reported in the summary.
+- **Interrupted scans are flagged:** on Ctrl+C/SIGTERM, partial results are saved with
+  `meta.partial: true` (and a `# PARTIAL` note in text output) so a consumer knows that absent
+  ports are *not* confirmed closed and should not be diffed as closures.
+- **Unreachable ≠ closed:** host/network-unreachable results are counted separately
+  (`meta.total_unreachable`), never silently recorded as "closed".
 - **File descriptors:** a `connect()` scan uses one descriptor per in-flight probe. GoScan
   raises its soft `RLIMIT_NOFILE` to the hard limit at startup and caps worker concurrency
   under that budget. If descriptors are still exhausted mid-scan, the affected dials are
@@ -97,6 +107,9 @@ GoScan -oF json -o /data/diffs/diff \
 - **Change-detection stability:** discovery gathers signal from both ICMP and a multi-port,
   RST-aware TCP knock, so a single dropped packet is unlikely to flip a live host to "down"
   and create spurious `NEW_HOST`/`CLOSED_HOST` churn in diffs.
+
+Both nmap-style attached flags (`-T4`, `-Td5`, `-p-`) and space-separated forms (`-T 4`,
+`-p 1-65535`) are accepted.
 
 ## Privileges
 
