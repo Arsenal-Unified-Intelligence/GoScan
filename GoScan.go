@@ -1157,60 +1157,133 @@ func (s *Scanner) grabBanner(conn net.Conn, port int) string {
 	return ""
 }
 
-func (s *Scanner) processBanner(data []byte, port int) string {
-	banner := strings.TrimSpace(string(data))
-	banner = strings.Map(func(r rune) rune {
+// sanitizeBanner strips control/non-printable bytes and collapses whitespace so a
+// banner is a single clean line. It does not, by itself, remove volatile content —
+// that is the job of the protocol-specific extractors below.
+func sanitizeBanner(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if r == '\t' || r == '\n' || r == '\r' {
+			return ' '
+		}
 		if r < 32 || r > 126 {
-			if r == '\n' || r == '\r' || r == '\t' {
-				return ' '
-			}
 			return -1
 		}
 		return r
-	}, banner)
-	banner = strings.TrimSpace(strings.ReplaceAll(banner, "  ", " "))
+	}, s)
+	return strings.Join(strings.Fields(s), " ")
+}
 
-	if strings.Contains(banner, "SSH-") {
-		if idx := strings.Index(banner, "SSH-"); idx >= 0 {
-			end := strings.IndexAny(banner[idx:], "\r\n ")
-			if end > 0 {
-				banner = banner[idx : idx+end]
-			} else {
-				banner = banner[idx:]
+// firstNonEmptyLine returns the first non-blank line of raw, line endings intact.
+func firstNonEmptyLine(raw string) string {
+	for _, ln := range strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n") {
+		if t := strings.TrimSpace(ln); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+// sshVersion extracts the SSH identification string (e.g. "SSH-2.0-OpenSSH_8.9"),
+// which is stable across scans.
+func sshVersion(raw string) string {
+	idx := strings.Index(raw, "SSH-")
+	if idx < 0 {
+		return ""
+	}
+	rest := raw[idx:]
+	if end := strings.IndexAny(rest, "\r\n "); end >= 0 {
+		rest = rest[:end]
+	}
+	return rest
+}
+
+// httpSummary reduces an HTTP response to a STABLE identity — the status line plus
+// the Server header only. Volatile headers (Date, Set-Cookie, ETag) and the body
+// are dropped so two scans of an unchanged server produce identical banners.
+func httpSummary(raw string) string {
+	lines := strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n")
+	status := ""
+	for _, ln := range lines {
+		if t := strings.TrimSpace(ln); strings.HasPrefix(t, "HTTP/") {
+			status = t
+			break
+		}
+	}
+	if status == "" {
+		status = firstNonEmptyLine(raw)
+	}
+	server := ""
+	for _, ln := range lines {
+		l := strings.TrimSpace(ln)
+		if l == "" {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(l), "server:") {
+			server = strings.TrimSpace(l[len("server:"):])
+			break
+		}
+	}
+	if server != "" {
+		return status + " | Server: " + server
+	}
+	return status
+}
+
+// mysqlSummary extracts a stable label from a MySQL handshake or error packet,
+// deliberately dropping the connecting IP that MySQL echoes in "host not allowed"
+// errors (volatile across source addresses, and an information leak in output).
+func mysqlSummary(raw string) string {
+	if strings.Contains(raw, "is not allowed to connect") {
+		return "mysql (host not allowed)"
+	}
+	// Protocol v10 handshake: NUL-terminated server version after a 5-byte header.
+	if len(raw) > 6 {
+		v := raw[5:]
+		if z := strings.IndexByte(v, 0); z > 0 {
+			if ver := sanitizeBanner(v[:z]); ver != "" {
+				return "mysql " + ver
 			}
 		}
-	} else if strings.Contains(banner, "HTTP") {
-		if idx := strings.Index(banner, "Server:"); idx >= 0 {
-			line := banner[idx:]
-			if end := strings.IndexAny(line, "\r\n"); end > 0 {
-				banner = strings.TrimSpace(line[:end])
-			}
-		} else if strings.HasPrefix(banner, "HTTP/") {
-			parts := strings.Fields(banner)
-			if len(parts) >= 3 {
-				banner = parts[0] + " " + parts[1] + " " + parts[2]
-			}
+	}
+	return "mysql"
+}
+
+func (s *Scanner) processBanner(data []byte, port int) string {
+	raw := string(data)
+	var banner string
+
+	switch {
+	case strings.Contains(raw, "SSH-"):
+		banner = sshVersion(raw)
+	case strings.Contains(raw, "HTTP/"):
+		banner = httpSummary(raw)
+	case port == 3306:
+		banner = mysqlSummary(raw)
+	case port == 135 || port == 139 || port == 445 || port == 3389 || port == 389:
+		// Binary protocols rarely yield a clean text version over connect+read;
+		// the stable, useful answer is the well-known service name.
+		if svc, ok := serviceNames[port]; ok {
+			return svc
 		}
-	} else if strings.Contains(banner, "FTP") || strings.Contains(banner, "ProFTPD") || strings.Contains(banner, "vsftpd") {
-		lines := strings.Split(banner, "\n")
-		if len(lines) > 0 {
-			banner = strings.TrimSpace(lines[0])
-		}
-	} else if strings.Contains(banner, "SMTP") || strings.Contains(banner, "ESMTP") {
-		lines := strings.Split(banner, "\n")
-		if len(lines) > 0 {
-			banner = strings.TrimSpace(lines[0])
-		}
-	} else if port == 135 || port == 139 || port == 445 || port == 3389 || port == 389 {
-		if len(banner) < 10 || strings.Count(banner, " ") > len(banner)/2 {
-			if svc, ok := serviceNames[port]; ok {
-				return svc
+		banner = firstNonEmptyLine(raw)
+	default:
+		banner = firstNonEmptyLine(raw)
+		// Some SMTP/Sendmail greetings append "; <date>" — drop it for stability.
+		if strings.Contains(banner, "SMTP") || strings.Contains(banner, "ESMTP") {
+			if i := strings.IndexByte(banner, ';'); i > 0 {
+				banner = strings.TrimSpace(banner[:i])
 			}
 		}
 	}
 
-	if len(banner) > 100 {
-		banner = banner[:100] + "..."
+	banner = sanitizeBanner(banner)
+	if banner == "" {
+		if svc, ok := serviceNames[port]; ok {
+			return svc
+		}
+	}
+	if len(banner) > 120 {
+		banner = banner[:120] + "..."
 	}
 	return banner
 }
