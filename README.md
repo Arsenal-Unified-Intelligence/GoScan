@@ -3,7 +3,7 @@
 A fast, reliable TCP network scanner built for **scheduled perimeter monitoring** of large
 (/16) subnets. GoScan runs on a schedule, scans an external subnet, and produces
 machine-readable output that a downstream tool (or AI agent) can diff against the previous run
-to detect change — new hosts, new open ports, and changed services.
+to detect change: new hosts, new open ports, and changed services.
 
 - **Reliable middle ground** between `masscan` (fast but misses services) and `nmap` (thorough
   but slow across a full /16).
