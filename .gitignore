@@ -6,6 +6,9 @@
 /GoScan-windows-*
 *.zip
 
+# Exception: distributable release zips are tracked on purpose
+!precompiled-binaries/*.zip
+
 # Scan output (may contain real network data — never commit)
 scan_test_*
 *-20[0-9][0-9]-[0-9][0-9]-[0-9][0-9].json
