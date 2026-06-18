@@ -1242,22 +1242,10 @@ func writeFileAtomic(path string, write func(io.Writer) error) error {
 	return os.Rename(tmpName, path)
 }
 
-// raiseFDLimit best-effort raises the soft open-file limit to the hard limit and
-// returns the resulting soft limit. A connect() scanner needs one descriptor per
-// in-flight probe, so headroom here directly bounds achievable concurrency.
-func raiseFDLimit() uint64 {
-	var lim syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil {
-		return 1024 // conservative fallback
-	}
-	if lim.Cur < lim.Max {
-		lim.Cur = lim.Max
-		_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &lim)
-		// Re-read in case the kernel clamped the value.
-		_ = syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim)
-	}
-	return lim.Cur
-}
+// raiseFDLimit best-effort raises the process open-file budget and returns it.
+// A connect() scanner needs one descriptor per in-flight probe, so headroom here
+// directly bounds achievable concurrency. Implemented per-platform (raiseFDLimit
+// lives in fdlimit_unix.go / fdlimit_windows.go).
 
 // capConcurrency limits a desired worker count so that concurrent dials stay
 // under the available file-descriptor budget, leaving fdReserve for other use.

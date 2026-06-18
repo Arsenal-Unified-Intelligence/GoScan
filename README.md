@@ -37,7 +37,7 @@ to detect change — new hosts, new open ports, and changed services.
 
 ```sh
 # Build
-go build -o GoScan ./GoScan.go
+go build -o GoScan .
 
 # Scan a /24 with fast discovery, thorough port scan, and service detection
 sudo ./GoScan -Td 5 -T 4 -sV -o lab-scan 192.168.10.0/24
@@ -57,7 +57,7 @@ Requires Go 1.21+.
 ```sh
 git clone https://github.com/Arsenal-Unified-Intelligence/GoScan.git
 cd GoScan
-go build -o GoScan ./GoScan.go
+go build -o GoScan .
 ```
 
 ### Prebuilt binaries
@@ -66,10 +66,10 @@ Static binaries for Linux (amd64), Windows (amd64), and macOS (amd64 + arm64) ar
 with `GOOS`/`GOARCH` cross-compilation, e.g.:
 
 ```sh
-GOOS=linux   GOARCH=amd64 go build -o GoScan-linux-amd64   ./GoScan.go
-GOOS=windows GOARCH=amd64 go build -o GoScan-windows-amd64.exe ./GoScan.go
-GOOS=darwin  GOARCH=amd64 go build -o GoScan-darwin-amd64  ./GoScan.go
-GOOS=darwin  GOARCH=arm64 go build -o GoScan-darwin-arm64  ./GoScan.go
+GOOS=linux   GOARCH=amd64 go build -o GoScan-linux-amd64 .
+GOOS=windows GOARCH=amd64 go build -o GoScan-windows-amd64.exe .
+GOOS=darwin  GOARCH=amd64 go build -o GoScan-darwin-amd64 .
+GOOS=darwin  GOARCH=arm64 go build -o GoScan-darwin-arm64 .
 ```
 
 ## Usage
