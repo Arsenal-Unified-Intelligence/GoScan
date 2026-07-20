@@ -220,7 +220,7 @@ while still letting the diff report hosts entering or leaving it.
     "discovery_timing": "Insane",
     "workers": 1010,
     "ports_scanned": "top100",
-    "goscan_version": "1.3",
+    "goscan_version": "1.4",
     "duration_seconds": 4,
     "hosts_discovered": 11,
     "total_open_ports": 62,

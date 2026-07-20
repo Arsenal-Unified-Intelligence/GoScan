@@ -28,7 +28,7 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
-const version = "1.3"
+const version = "1.4"
 
 const (
 	defaultTimeout = 2 * time.Second
