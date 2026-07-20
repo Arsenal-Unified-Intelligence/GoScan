@@ -1,14 +1,14 @@
-# Precompiled binaries — GoScan v1.4
+# Precompiled binaries — GoScan v1.5
 
 Ready-to-run builds. Download the zip for your platform, unzip, and run. Each zip contains the
 binary plus the project `README.md` and `LICENSE`.
 
 | Platform | File | Binary inside |
 |----------|------|---------------|
-| Linux (x86-64) | `GoScan-v1.4-linux-amd64.zip` | `GoScan` |
-| Windows (x86-64) | `GoScan-v1.4-windows-amd64.zip` | `GoScan.exe` |
-| macOS — Intel | `GoScan-v1.4-darwin-amd64.zip` | `GoScan` |
-| macOS — Apple Silicon (M1/M2/M3) | `GoScan-v1.4-darwin-arm64.zip` | `GoScan` |
+| Linux (x86-64) | `GoScan-v1.5-linux-amd64.zip` | `GoScan` |
+| Windows (x86-64) | `GoScan-v1.5-windows-amd64.zip` | `GoScan.exe` |
+| macOS — Intel | `GoScan-v1.5-darwin-amd64.zip` | `GoScan` |
+| macOS — Apple Silicon (M1/M2/M3) | `GoScan-v1.5-darwin-arm64.zip` | `GoScan` |
 
 > macOS ships in two builds because an Apple Silicon binary will not run on an Intel Mac and
 > vice-versa. If unsure: Apple menu → About This Mac. "Apple M…" → use `arm64`; "Intel" → use `amd64`.
@@ -27,14 +27,14 @@ shasum -a 256 -c SHA256SUMS    # macOS
 
 ```sh
 # Linux / macOS — unzip, make executable, run
-unzip GoScan-v1.4-linux-amd64.zip
+unzip GoScan-v1.5-linux-amd64.zip
 chmod +x GoScan
 sudo ./GoScan -Td 5 -T 4 -sV -o scan 192.168.1.0/24
 ```
 
 ```powershell
 # Windows (PowerShell) — Expand-Archive, then run
-Expand-Archive GoScan-v1.4-windows-amd64.zip -DestinationPath GoScan
+Expand-Archive GoScan-v1.5-windows-amd64.zip -DestinationPath GoScan
 .\GoScan\GoScan.exe -Td 5 -T 4 -sV -o scan 192.168.1.0/24
 ```
 

@@ -28,7 +28,7 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
-const version = "1.4"
+const version = "1.5"
 
 const (
 	defaultTimeout = 2 * time.Second
@@ -207,6 +207,7 @@ type Scanner struct {
 	target       string
 	portsDesc    string
 	hostnames    map[string][]string // ip -> hostnames that resolved to it (read-only after setup)
+	unresolved   []string            // hostnames that failed DNS and were skipped
 
 	mu             sync.Mutex
 	results        []ScanResult
@@ -533,16 +534,23 @@ func main() {
 		printBanner(timing.Name, discTiming.Name, finalWorkers, finalTimeout, finalRetries)
 	}
 
-	ips, hostnames, err := parseTargetSpecs(targetSpecs)
+	ips, hostnames, unresolved, err := parseTargetSpecs(targetSpecs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[!] Error parsing target: %v\n", err)
 		os.Exit(1)
 	}
 	if len(ips) == 0 {
-		fmt.Fprintln(os.Stderr, "[!] Error: target list expanded to zero hosts")
+		// Every target was unresolvable, so there is nothing to scan and no
+		// results to compare — an empty report would read as a dead network.
+		if len(unresolved) > 0 {
+			fmt.Fprintf(os.Stderr, "[!] Error: no targets left to scan (%d hostname(s) failed to resolve)\n", len(unresolved))
+		} else {
+			fmt.Fprintln(os.Stderr, "[!] Error: target list expanded to zero hosts")
+		}
 		os.Exit(1)
 	}
 	scanner.hostnames = hostnames
+	scanner.unresolved = unresolved
 	if len(hostnames) > 0 && !quietMode {
 		names := 0
 		for _, n := range hostnames {
@@ -1820,6 +1828,10 @@ type JSONScanMeta struct {
 	TotalFiltered  int64  `json:"total_filtered_ports"`
 	TotalUnreachable int64 `json:"total_unreachable"`
 	Partial        bool   `json:"partial"` // true if the scan was interrupted; port absences are not authoritative
+	// Hostnames that failed to resolve and were skipped. Their addresses are
+	// absent from this scan for a DNS reason, not because anything went down —
+	// without this a consumer would read the gap as hosts disappearing.
+	UnresolvedHostnames []string `json:"unresolved_hostnames,omitempty"`
 }
 
 type JSONPort struct {
@@ -1907,7 +1919,8 @@ func (s *Scanner) saveResultsJSON(filename string, duration time.Duration) error
 			TotalOpenPorts:   atomic.LoadInt64(&s.openPorts),
 			TotalFiltered:    atomic.LoadInt64(&s.filteredPorts),
 			TotalUnreachable: atomic.LoadInt64(&s.unreachableErrors),
-			Partial:          atomic.LoadInt32(&s.partial) != 0,
+			Partial:             atomic.LoadInt32(&s.partial) != 0,
+			UnresolvedHostnames: s.unresolved,
 		},
 		Hosts: hosts,
 	}
@@ -2061,6 +2074,23 @@ type DiffReport struct {
 	} `json:"summary"`
 }
 
+// unresolvedUnion returns the sorted set of hostnames that failed to resolve in
+// either scan being compared.
+func unresolvedUnion(a, b JSONScanMeta) []string {
+	var out []string
+	seen := make(map[string]bool)
+	for _, list := range [][]string{a.UnresolvedHostnames, b.UnresolvedHostnames} {
+		for _, n := range list {
+			if !seen[n] {
+				seen[n] = true
+				out = append(out, n)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func hostnameSuffix(hostname string) string {
 	if hostname == "" {
 		return ""
@@ -2119,6 +2149,14 @@ func runDiff(file1, file2, outputFormat, outFile string) int {
 	}
 	if scan1.Meta.Partial || scan2.Meta.Partial {
 		fmt.Fprintf(os.Stderr, "[!] Warning: a scan is marked partial (interrupted) — absent ports are not confirmed closed; CLOSED_* changes may be false\n")
+	}
+	// A name that failed DNS was skipped, so its addresses are missing from that
+	// scan for a reason unrelated to the network. Left unflagged this reads as
+	// hosts going down — precisely the false positive an unattended monitor must
+	// not page on.
+	if names := unresolvedUnion(scan1.Meta, scan2.Meta); len(names) > 0 {
+		fmt.Fprintf(os.Stderr, "[!] Warning: hostname(s) failed to resolve during a scan and were skipped (%s) — their absence is a DNS failure, not a host going down; CLOSED_HOST changes may be false\n",
+			strings.Join(names, ", "))
 	}
 
 	// Index hosts by IP.
@@ -2348,14 +2386,21 @@ const (
 // scatter a round-robin name's ports across different machines, and would leave
 // the host sorted as 0 by ipToUint32 — making output order nondeterministic and
 // breaking the stable-output contract that diff mode depends on.
-func parseTargetSpecs(specs []targetSpec) ([]string, map[string][]string, error) {
+// A name that fails to resolve is reported and skipped rather than aborting the
+// run: DNS is environmental and transient, and one stale record should not cost
+// an unattended scan its entire remaining scope. Malformed entries still abort —
+// those are typos in the file that will never fix themselves. Skipped names are
+// returned so they can be recorded in scan metadata, because a name that silently
+// vanishes from a scan would otherwise surface in the next diff as a CLOSED_HOST
+// that never actually went down.
+func parseTargetSpecs(specs []targetSpec) ([]string, map[string][]string, []string, error) {
 	kinds := make([]specKind, len(specs))
 	var names []string
 	nameSeen := make(map[string]bool)
 	for i, spec := range specs {
 		kind, err := classifyTargetSpec(spec.text)
 		if err != nil {
-			return nil, nil, spec.errorf("%s", err)
+			return nil, nil, nil, spec.errorf("%s", err)
 		}
 		kinds[i] = kind
 		if kind == specHostname && !nameSeen[spec.text] {
@@ -2365,13 +2410,20 @@ func parseTargetSpecs(specs []targetSpec) ([]string, map[string][]string, error)
 	}
 
 	resolved, resolveErrs := resolveHostnames(names)
+	var unresolved []string
+	reported := make(map[string]bool)
 	for i, spec := range specs {
-		if kinds[i] == specHostname {
-			if err := resolveErrs[spec.text]; err != nil {
-				return nil, nil, spec.errorf("cannot resolve %q: %v", spec.text, err)
-			}
+		if kinds[i] != specHostname {
+			continue
+		}
+		if err := resolveErrs[spec.text]; err != nil && !reported[spec.text] {
+			reported[spec.text] = true
+			unresolved = append(unresolved, spec.text)
+			fmt.Fprintf(os.Stderr, "[!] Warning: %s — skipping this target\n",
+				spec.errorf("cannot resolve %q: %v", spec.text, err))
 		}
 	}
+	sort.Strings(unresolved)
 
 	seen := make(map[string]bool)
 	var ips []string
@@ -2393,7 +2445,7 @@ func parseTargetSpecs(specs []targetSpec) ([]string, map[string][]string, error)
 		}
 		expanded, err := parseTarget(spec.text)
 		if err != nil {
-			return nil, nil, spec.errorf("%s", err)
+			return nil, nil, nil, spec.errorf("%s", err)
 		}
 		for _, ip := range expanded {
 			add(ip)
@@ -2404,7 +2456,7 @@ func parseTargetSpecs(specs []targetSpec) ([]string, map[string][]string, error)
 	for ip := range hostnames {
 		sort.Strings(hostnames[ip])
 	}
-	return ips, hostnames, nil
+	return ips, hostnames, unresolved, nil
 }
 
 func appendUnique(list []string, s string) []string {

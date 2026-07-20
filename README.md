@@ -62,15 +62,19 @@ go build -o GoScan .
 
 ### Prebuilt binaries
 
-Static binaries for Linux (amd64), Windows (amd64), and macOS (amd64 + arm64) are produced
-with `GOOS`/`GOARCH` cross-compilation, e.g.:
+Ready-to-run zips for Linux (amd64), Windows (amd64), and macOS (amd64 + arm64) live in
+[`precompiled-binaries/`](precompiled-binaries/), with `SHA256SUMS` to verify them.
+
+To cut a new release, bump `const version` in `GoScan.go` and run:
 
 ```sh
-GOOS=linux   GOARCH=amd64 go build -o GoScan-linux-amd64 .
-GOOS=windows GOARCH=amd64 go build -o GoScan-windows-amd64.exe .
-GOOS=darwin  GOARCH=amd64 go build -o GoScan-darwin-amd64 .
-GOOS=darwin  GOARCH=arm64 go build -o GoScan-darwin-arm64 .
+./release.sh
 ```
+
+It reads the version from the source rather than taking it as an argument, so the binaries, the
+zip names, and the `goscan_version` stamped into every scan report cannot drift apart. It vets
+before building, replaces the previous release's zips, regenerates `SHA256SUMS`, and smoke-tests
+that the built binary reports the expected version.
 
 ## Usage
 
@@ -127,11 +131,11 @@ vpn.example.com
 - Duplicates and overlaps are collapsed, so a `/24` plus a host inside it scans that host once.
 - IPv4 only — an IPv6 entry is rejected with a clear message.
 - Targets given on the command line are added to those read from the file.
-- Entries are validated up front. A malformed or unresolvable line aborts the scan with the
-  file and line number rather than becoming a phantom target that silently reports as down:
+- Entries are validated up front. A **malformed** line aborts the scan with the file and line
+  number, rather than becoming a phantom target that silently reports as down:
 
   ```
-  [!] Error parsing target: perimeter.txt:7: cannot resolve "vpn.exmaple.com": no such host
+  [!] Error parsing target: perimeter.txt:7: invalid IP address "10.0.0.300"
   ```
 
 #### Hostnames
@@ -156,6 +160,26 @@ should catch, and they are invisible to an address-keyed comparison:
 ```
 [~] MOVED        www.example.com    203.0.113.10  →  203.0.113.77
 ```
+
+**A name that fails to resolve is warned about and skipped, not fatal.** DNS is environmental
+and transient, and one stale record should not cost an unattended scan the rest of its scope:
+
+```
+[!] Warning: perimeter.txt:7: cannot resolve "vpn.exmaple.com": no such host — skipping this target
+```
+
+Skipped names are recorded in scan metadata as `unresolved_hostnames`, and diff mode warns when
+either scan has any. This matters more than it looks: a skipped name's addresses are simply
+absent from the scan, which an address-keyed diff would otherwise report as `CLOSED_HOST` — a
+page-worthy alert for hosts that never went down.
+
+```
+[!] Warning: hostname(s) failed to resolve during a scan and were skipped (www.example.com)
+    — their absence is a DNS failure, not a host going down; CLOSED_HOST changes may be false
+```
+
+If *every* target fails to resolve the scan does exit non-zero, since an empty report would
+otherwise read as a dead network.
 
 #### URLs
 
@@ -220,13 +244,14 @@ while still letting the diff report hosts entering or leaving it.
     "discovery_timing": "Insane",
     "workers": 1010,
     "ports_scanned": "top100",
-    "goscan_version": "1.4",
+    "goscan_version": "1.5",
     "duration_seconds": 4,
     "hosts_discovered": 11,
     "total_open_ports": 62,
     "total_filtered_ports": 0,
     "total_unreachable": 0,
-    "partial": false                       // true if the scan was interrupted
+    "partial": false,                      // true if the scan was interrupted
+    "unresolved_hostnames": []             // names skipped due to DNS failure (omitted if none)
   },
   "hosts": [
     {
@@ -260,7 +285,9 @@ GoScan --diff old.json new.json -o changes # save to a file
 Emits `NEW_HOST`, `CLOSED_HOST`, `NEW_PORT`, `CLOSED_PORT`, `CHANGED_BANNER`, and
 `HOSTNAME_MOVED` records plus a summary. **Exit code 2** when any change is found (0 when
 clean), so a wrapper can act on it directly. Diff warns if the two scans cover different
-targets, or if either is marked partial (in which case `CLOSED_*` changes may be spurious).
+targets, if either is marked partial (in which case `CLOSED_*` changes may be spurious), or if
+either skipped a hostname that failed to resolve (in which case `CLOSED_HOST` may be a DNS
+failure rather than a host going down).
 
 `HOSTNAME_MOVED` fires when a name scanned in both runs resolves to a different address. It
 correlates what would otherwise read as two unrelated events:
