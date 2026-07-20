@@ -92,16 +92,98 @@ GoScan --diff scan-2026-06-16.json scan-2026-06-20.json -oF json
 
 # Resume an interrupted scan: skip already-completed hosts, finish the rest
 GoScan -p- -resume scan-2026-06-17.json -o scan 10.0.0.0/16
+
+# Read targets from a file (nmap's -iL)
+GoScan -iL perimeter.txt -Td 5 -T 4 -sV -o perimeter
+
+# Several targets on one command line
+GoScan -p 443 10.1.0.0/24 10.2.0.0/24 192.168.5.10
 ```
 
 Argument handling is forgiving: nmap-style attached flags (`-T4`, `-Td5`, `-p-`) and
 space-separated forms (`-T 4`, `-p 1-65535`) both work, and flags may appear before or after
 the target.
 
+### Target lists (`-iL`)
+
+`-iL` reads targets from a file instead of (or in addition to) the command line — the practical
+way to drive a perimeter scan from a maintained inventory rather than a hard-coded CIDR in a
+cron entry. Entries may be **IPv4 addresses, CIDR ranges, and hostnames, mixed freely**.
+
+```
+# perimeter.txt — external ranges, reviewed quarterly
+203.0.113.0/24          # DMZ
+198.51.100.10  198.51.100.11    # edge load balancers
+198.51.100.32,198.51.100.33     # commas work too
+
+www.example.com         # hostnames are resolved before the scan starts
+vpn.example.com
+192.0.2.0/28            # partner VPN segment
+```
+
+- One or more targets per line, separated by whitespace or commas.
+- `#` starts a comment (whole-line or trailing); blank lines are ignored.
+- Use `-iL -` to read the list from stdin, e.g. `inventory-export | GoScan -iL - -o scan`.
+- Duplicates and overlaps are collapsed, so a `/24` plus a host inside it scans that host once.
+- IPv4 only — an IPv6 entry is rejected with a clear message.
+- Targets given on the command line are added to those read from the file.
+- Entries are validated up front. A malformed or unresolvable line aborts the scan with the
+  file and line number rather than becoming a phantom target that silently reports as down:
+
+  ```
+  [!] Error parsing target: perimeter.txt:7: cannot resolve "vpn.exmaple.com": no such host
+  ```
+
+#### Hostnames
+
+Hostnames are resolved **once, before scanning**, and the resulting addresses are scanned as
+ordinary IPs. This is deliberate — passing names down to the probes instead would re-resolve on
+every port probe, would scatter a round-robin name's ports across different machines, and would
+leave the host unsortable by address, making output order vary between runs and breaking the
+stable-output contract diff mode depends on.
+
+A name resolving to several A records becomes several scanned hosts, which is the truthful
+representation. The names are recorded on each host in the output:
+
+```json
+{ "ip": "203.0.113.10", "hostnames": ["www.example.com"], "ports": [ ... ] }
+```
+
+Because the mapping is recorded, diff mode can report a name that has **moved to a new
+address** — DNS repointing and subdomain takeover are exactly the changes a perimeter monitor
+should catch, and they are invisible to an address-keyed comparison:
+
+```
+[~] MOVED        www.example.com    203.0.113.10  →  203.0.113.77
+```
+
+#### URLs
+
+URLs are **not** accepted — nmap does not take them either, and a URL implies a port that would
+silently contradict `-p`. Use the bare hostname; the error tells you which:
+
+```
+[!] Error parsing target: perimeter.txt:4: URLs are not supported —
+    use the hostname "example.com" instead of "https://example.com/app/login"
+```
+
+To scan targets from a file that contains URLs, strip them first:
+
+```sh
+sed -E 's#^[a-z]+://##; s#[/?].*$##; s#.*@##; s#:[0-9]+$##' urls.txt | GoScan -iL - -o scan
+```
+
+#### Scan metadata
+
+The `target` field records the list as `list:perimeter.txt`, not the expanded host list. That
+keeps [diff mode](#diff-mode)'s "different targets" guard quiet across runs of the same list
+while still letting the diff report hosts entering or leaving it.
+
 ## Command-line options
 
 | Flag       | Default | Meaning |
 |------------|---------|---------|
+| `-iL`      | —       | Read targets from a file, one or more per line (`-` = stdin); see [Target lists](#target-lists--il) |
 | `-p`       | top 100 | Ports: `22,80,443`, a range `1-1000`, or `-` for all 65535 |
 | `-sV`      | off     | Probe open ports for service/version banners |
 | `-T`       | `3`     | Timing template 0–5 (T0 Paranoid · T1 Sneaky · T2 Polite · T3 Normal · T4 Aggressive · T5 Insane) |
@@ -149,6 +231,7 @@ the target.
   "hosts": [
     {
       "ip": "192.168.10.10",
+      "hostnames": ["dc01.lab.local"],     // omitted unless a name resolved here
       "discovery_method": "icmp",          // icmp | tcp | assumed | single
       "fingerprint": "13914fea9d14f8b3",   // SHA-256 of open ports+banners (change-detection)
       "complete": true,                    // false if this host wasn't fully scanned
@@ -163,7 +246,8 @@ the target.
 Hosts and ports are sorted deterministically (IPs numerically, ports ascending) so diffs are
 stable. The `fingerprint` lets a consumer do an O(n) pass and only deep-inspect hosts whose
 fingerprint changed. `txt` is human-readable; `csv` has columns
-`IP,Port,State,Service,Discovery Method,Fingerprint`.
+`IP,Port,State,Service,Discovery Method,Fingerprint,Hostnames` — `Hostnames` was appended last
+so existing column positions stay valid for anything already parsing this CSV.
 
 ## Diff mode
 
@@ -173,10 +257,19 @@ GoScan --diff old.json new.json -oF json   # machine-readable, for an agent
 GoScan --diff old.json new.json -o changes # save to a file
 ```
 
-Emits `NEW_HOST`, `CLOSED_HOST`, `NEW_PORT`, `CLOSED_PORT`, and `CHANGED_BANNER` records and a
-summary. **Exit code 2** when any change is found (0 when clean), so a wrapper can act on it
-directly. Diff warns if the two scans cover different targets, or if either is marked partial
-(in which case `CLOSED_*` changes may be spurious).
+Emits `NEW_HOST`, `CLOSED_HOST`, `NEW_PORT`, `CLOSED_PORT`, `CHANGED_BANNER`, and
+`HOSTNAME_MOVED` records plus a summary. **Exit code 2** when any change is found (0 when
+clean), so a wrapper can act on it directly. Diff warns if the two scans cover different
+targets, or if either is marked partial (in which case `CLOSED_*` changes may be spurious).
+
+`HOSTNAME_MOVED` fires when a name scanned in both runs resolves to a different address. It
+correlates what would otherwise read as two unrelated events:
+
+```
+[-] CLOSED HOST  203.0.113.10 (www.example.com)
+[+] NEW HOST     203.0.113.77 (www.example.com)
+[~] MOVED        www.example.com    203.0.113.10  →  203.0.113.77
+```
 
 ## Resume
 
@@ -208,7 +301,8 @@ TODAY=$(date +%F)
 PREV=$(ls -1 "$SCANS"/perimeter-*.json 2>/dev/null | tail -1)
 
 # Scan (quiet mode auto-enables when stdout isn't a TTY)
-/opt/goscan/GoScan -Td 5 -T 4 -sV -o "$SCANS/perimeter" -oF json 10.20.0.0/16
+# -iL keeps the scope in a reviewable file instead of hard-coded in this script
+/opt/goscan/GoScan -Td 5 -T 4 -sV -o "$SCANS/perimeter" -oF json -iL /opt/goscan/perimeter.txt
 
 NEW="$SCANS/perimeter-$TODAY.json"
 if [ -n "$PREV" ] && [ "$PREV" != "$NEW" ]; then

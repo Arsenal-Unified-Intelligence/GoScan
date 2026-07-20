@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -21,6 +22,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
@@ -204,6 +206,7 @@ type Scanner struct {
 	discTiming   TimingTemplate // separate timing for discovery phase
 	target       string
 	portsDesc    string
+	hostnames    map[string][]string // ip -> hostnames that resolved to it (read-only after setup)
 
 	mu             sync.Mutex
 	results        []ScanResult
@@ -308,6 +311,7 @@ func normalizeArgs(args []string) []string {
 var valueFlags = map[string]bool{
 	"p": true, "o": true, "workers": true, "timeout": true, "retries": true,
 	"T": true, "Td": true, "oF": true, "diff": true, "diff2": true, "resume": true,
+	"iL": true,
 }
 
 // reorderArgs moves flags (and their values) ahead of positional arguments so that
@@ -356,11 +360,13 @@ func main() {
 	diffFile1 := flag.String("diff", "", "Compare two JSON scan files: --diff scan1.json scan2.json")
 	diffFile2 := flag.String("diff2", "", "Second file for diff comparison")
 	resumeFile := flag.String("resume", "", "Resume from a prior JSON scan: skip already-completed hosts, merge their results")
+	targetFile := flag.String("iL", "", "Read targets from file (one or more per line, # comments ok, - for stdin)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "GoScan v%s - Fast & Smart Network Scanner\n\n", version)
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] <target>\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "Target:  Single IP (192.168.1.1) or CIDR (192.168.1.0/24)\n\n")
+		fmt.Fprintf(os.Stderr, "Target:  Single IP (192.168.1.1) or CIDR (192.168.1.0/24); multiple targets allowed\n")
+		fmt.Fprintf(os.Stderr, "         Or read them from a file: -iL targets.txt (- for stdin)\n\n")
 		fmt.Fprintf(os.Stderr, "Diff:    %s --diff monday.json friday.json\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Timing:  T0=Paranoid T1=Sneaky T2=Polite T3=Normal T4=Aggressive T5=Insane\n")
 		fmt.Fprintf(os.Stderr, "         Use -Td for discovery phase, -T for port scan phase (sparse networks)\n\n")
@@ -372,6 +378,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s -Td 5 -T 4 -sV -o scan 10.0.0.0/16   # fast discovery, thorough scan\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s --diff scan-2026-06-16.json scan-2026-06-20.json\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -resume scan-2026-06-17.json -o scan 10.0.0.0/16   # finish an interrupted scan\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -iL perimeter.txt -Td 5 -T 4 -sV -o perimeter    # targets from a file\n", os.Args[0])
 	}
 
 	flag.CommandLine.Parse(reorderArgs(normalizeArgs(os.Args[1:])))
@@ -389,13 +396,42 @@ func main() {
 		os.Exit(exitCode)
 	}
 
-	if flag.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "Error: target is required")
+	// Targets come from -iL, positional arguments, or both.
+	var targetSpecs []targetSpec
+	if *targetFile != "" {
+		fileSpecs, ferr := readTargetFile(*targetFile)
+		if ferr != nil {
+			fmt.Fprintf(os.Stderr, "[!] Error reading target file: %v\n", ferr)
+			os.Exit(1)
+		}
+		targetSpecs = append(targetSpecs, fileSpecs...)
+	}
+	for _, arg := range flag.Args() {
+		targetSpecs = append(targetSpecs, targetSpec{text: arg})
+	}
+
+	if len(targetSpecs) == 0 {
+		fmt.Fprintln(os.Stderr, "Error: target is required (a positional target, or -iL <file>)")
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	target := flag.Arg(0)
+	// Descriptor recorded in scan metadata. For a target file this stays the file
+	// reference rather than the expanded host list, so the diff guard keeps matching
+	// across runs of the same list even as entries are added to or removed from it —
+	// which is exactly the change the diff exists to report.
+	target := strings.Join(flag.Args(), " ")
+	if *targetFile != "" {
+		src := "list:" + *targetFile
+		if *targetFile == "-" {
+			src = "list:<stdin>"
+		}
+		if target == "" {
+			target = src
+		} else {
+			target = src + " " + target
+		}
+	}
 
 	timingKey := strings.ToUpper(*timingStr)
 	if !strings.HasPrefix(timingKey, "T") {
@@ -497,10 +533,22 @@ func main() {
 		printBanner(timing.Name, discTiming.Name, finalWorkers, finalTimeout, finalRetries)
 	}
 
-	ips, err := parseTarget(target)
+	ips, hostnames, err := parseTargetSpecs(targetSpecs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[!] Error parsing target: %v\n", err)
 		os.Exit(1)
+	}
+	if len(ips) == 0 {
+		fmt.Fprintln(os.Stderr, "[!] Error: target list expanded to zero hosts")
+		os.Exit(1)
+	}
+	scanner.hostnames = hostnames
+	if len(hostnames) > 0 && !quietMode {
+		names := 0
+		for _, n := range hostnames {
+			names += len(n)
+		}
+		fmt.Printf("[>] Resolved %d hostname(s) to %d address(es)\n", names, len(hostnames))
 	}
 
 	var portList []int
@@ -1692,6 +1740,9 @@ func (s *Scanner) printResults(duration time.Duration, quiet bool) {
 		s.mu.Unlock()
 
 		fmt.Printf("Host: %s", ip)
+		if names := s.hostnames[ip]; len(names) > 0 {
+			fmt.Printf(" (%s)", strings.Join(names, ", "))
+		}
 		if hInfo != nil && hInfo.Method != "" && hInfo.Method != "single" {
 			fmt.Printf(" [%s]", hInfo.Method)
 		}
@@ -1779,6 +1830,7 @@ type JSONPort struct {
 
 type JSONHost struct {
 	IP          string     `json:"ip"`
+	Hostnames   []string   `json:"hostnames,omitempty"` // names from -iL / args that resolved here
 	Method      string     `json:"discovery_method,omitempty"`
 	Fingerprint string     `json:"fingerprint"`
 	Complete    bool       `json:"complete"` // false if this host wasn't fully scanned (interrupted); enables --resume
@@ -1830,6 +1882,7 @@ func (s *Scanner) saveResultsJSON(filename string, duration time.Duration) error
 
 		hosts = append(hosts, JSONHost{
 			IP:          ip,
+			Hostnames:   s.hostnames[ip],
 			Method:      method,
 			Fingerprint: hostFingerprint(results),
 			Complete:    s.hostComplete(ip),
@@ -1898,6 +1951,9 @@ func (s *Scanner) saveResultsTXT(filename string) error {
 			s.mu.Unlock()
 
 			fmt.Fprintf(f, "Host: %s", ip)
+			if names := s.hostnames[ip]; len(names) > 0 {
+				fmt.Fprintf(f, " (%s)", strings.Join(names, ", "))
+			}
 			if hInfo != nil && hInfo.Method != "" {
 				fmt.Fprintf(f, " [%s]", hInfo.Method)
 			}
@@ -1937,7 +1993,9 @@ func (s *Scanner) saveResultsCSV(filename string) error {
 
 	return writeFileAtomic(filename, func(out io.Writer) error {
 		w := csv.NewWriter(out)
-		if err := w.Write([]string{"IP", "Port", "State", "Service", "Discovery Method", "Fingerprint"}); err != nil {
+		// "Hostnames" is appended last so existing column positions stay valid
+		// for anything already consuming this CSV.
+		if err := w.Write([]string{"IP", "Port", "State", "Service", "Discovery Method", "Fingerprint", "Hostnames"}); err != nil {
 			return err
 		}
 
@@ -1954,9 +2012,10 @@ func (s *Scanner) saveResultsCSV(filename string) error {
 				method = hInfo.Method
 			}
 			fp := hostFingerprint(results)
+			names := strings.Join(s.hostnames[ip], " ")
 
 			if len(results) == 0 {
-				if err := w.Write([]string{ip, "-", "up", "no open ports", method, fp}); err != nil {
+				if err := w.Write([]string{ip, "-", "up", "no open ports", method, fp, names}); err != nil {
 					return err
 				}
 			} else {
@@ -1965,7 +2024,7 @@ func (s *Scanner) saveResultsCSV(filename string) error {
 					if svc == "" {
 						svc = "unknown"
 					}
-					if err := w.Write([]string{ip, strconv.Itoa(r.Port), r.State, svc, method, fp}); err != nil {
+					if err := w.Write([]string{ip, strconv.Itoa(r.Port), r.State, svc, method, fp, names}); err != nil {
 						return err
 					}
 				}
@@ -1979,12 +2038,13 @@ func (s *Scanner) saveResultsCSV(filename string) error {
 // ── Diff mode ─────────────────────────────────────────────────────────────────
 
 type DiffChange struct {
-	Type    string `json:"type"`    // NEW_HOST, CLOSED_HOST, NEW_PORT, CLOSED_PORT, CHANGED_BANNER
-	IP      string `json:"ip"`
-	Port    int    `json:"port,omitempty"`
-	State   string `json:"state,omitempty"`
-	Before  string `json:"before,omitempty"`
-	After   string `json:"after,omitempty"`
+	Type     string `json:"type"` // NEW_HOST, CLOSED_HOST, NEW_PORT, CLOSED_PORT, CHANGED_BANNER, HOSTNAME_MOVED
+	IP       string `json:"ip"`
+	Hostname string `json:"hostname,omitempty"` // set on HOSTNAME_MOVED and host-level changes
+	Port     int    `json:"port,omitempty"`
+	State    string `json:"state,omitempty"`
+	Before   string `json:"before,omitempty"`
+	After    string `json:"after,omitempty"`
 }
 
 type DiffReport struct {
@@ -1992,12 +2052,35 @@ type DiffReport struct {
 	File2   JSONScanMeta `json:"scan_b"`
 	Changes []DiffChange `json:"changes"`
 	Summary struct {
-		NewHosts      int `json:"new_hosts"`
-		ClosedHosts   int `json:"closed_hosts"`
-		NewPorts      int `json:"new_ports"`
-		ClosedPorts   int `json:"closed_ports"`
-		ChangedBanner int `json:"changed_banners"`
+		NewHosts       int `json:"new_hosts"`
+		ClosedHosts    int `json:"closed_hosts"`
+		NewPorts       int `json:"new_ports"`
+		ClosedPorts    int `json:"closed_ports"`
+		ChangedBanner  int `json:"changed_banners"`
+		HostnamesMoved int `json:"hostnames_moved"`
 	} `json:"summary"`
+}
+
+func hostnameSuffix(hostname string) string {
+	if hostname == "" {
+		return ""
+	}
+	return " (" + hostname + ")"
+}
+
+// hostnameIndex maps each hostname seen in a scan to the sorted set of addresses
+// it resolved to, letting two scans be compared by name rather than by address.
+func hostnameIndex(hosts []JSONHost) map[string][]string {
+	idx := make(map[string][]string)
+	for _, h := range hosts {
+		for _, n := range h.Hostnames {
+			idx[n] = appendUnique(idx[n], h.IP)
+		}
+	}
+	for n := range idx {
+		sortIPsNumerically(idx[n])
+	}
+	return idx
 }
 
 func loadJSONScan(path string) (*JSONOutput, error) {
@@ -2070,7 +2153,7 @@ func runDiff(file1, file2, outputFormat, outFile string) int {
 		h2, in2 := hosts2[ip]
 
 		if in2 && !in1 {
-			report.Changes = append(report.Changes, DiffChange{Type: "NEW_HOST", IP: ip})
+			report.Changes = append(report.Changes, DiffChange{Type: "NEW_HOST", IP: ip, Hostname: strings.Join(h2.Hostnames, " ")})
 			report.Summary.NewHosts++
 			for _, p := range h2.Ports {
 				report.Changes = append(report.Changes, DiffChange{Type: "NEW_PORT", IP: ip, Port: p.Port, State: p.State, After: p.Service})
@@ -2079,7 +2162,7 @@ func runDiff(file1, file2, outputFormat, outFile string) int {
 			continue
 		}
 		if in1 && !in2 {
-			report.Changes = append(report.Changes, DiffChange{Type: "CLOSED_HOST", IP: ip})
+			report.Changes = append(report.Changes, DiffChange{Type: "CLOSED_HOST", IP: ip, Hostname: strings.Join(h1.Hostnames, " ")})
 			report.Summary.ClosedHosts++
 			continue
 		}
@@ -2129,8 +2212,34 @@ func runDiff(file1, file2, outputFormat, outFile string) int {
 		}
 	}
 
+	// A hostname that now resolves elsewhere is one of the more security-relevant
+	// perimeter changes there is (DNS repointing, subdomain takeover), and the
+	// IP-keyed comparison above cannot see it: the old address just looks closed
+	// and the new one looks new, with nothing tying the two together.
+	names1 := hostnameIndex(scan1.Hosts)
+	names2 := hostnameIndex(scan2.Hosts)
+	var sharedNames []string
+	for n := range names1 {
+		if _, ok := names2[n]; ok {
+			sharedNames = append(sharedNames, n)
+		}
+	}
+	sort.Strings(sharedNames)
+	for _, n := range sharedNames {
+		before := strings.Join(names1[n], " ")
+		after := strings.Join(names2[n], " ")
+		if before == after {
+			continue
+		}
+		report.Changes = append(report.Changes, DiffChange{
+			Type: "HOSTNAME_MOVED", IP: after, Hostname: n, Before: before, After: after,
+		})
+		report.Summary.HostnamesMoved++
+	}
+
 	totalChanges := report.Summary.NewHosts + report.Summary.ClosedHosts +
-		report.Summary.NewPorts + report.Summary.ClosedPorts + report.Summary.ChangedBanner
+		report.Summary.NewPorts + report.Summary.ClosedPorts + report.Summary.ChangedBanner +
+		report.Summary.HostnamesMoved
 
 	// Output.
 	if strings.ToLower(outputFormat) == "json" {
@@ -2165,9 +2274,11 @@ func runDiff(file1, file2, outputFormat, outFile string) int {
 			for _, c := range report.Changes {
 				switch c.Type {
 				case "NEW_HOST":
-					fmt.Printf("[+] NEW HOST     %s\n", c.IP)
+					fmt.Printf("[+] NEW HOST     %s%s\n", c.IP, hostnameSuffix(c.Hostname))
 				case "CLOSED_HOST":
-					fmt.Printf("[-] CLOSED HOST  %s\n", c.IP)
+					fmt.Printf("[-] CLOSED HOST  %s%s\n", c.IP, hostnameSuffix(c.Hostname))
+				case "HOSTNAME_MOVED":
+					fmt.Printf("[~] MOVED        %-18s %s  →  %s\n", c.Hostname, c.Before, c.After)
 				case "NEW_PORT":
 					fmt.Printf("[+] NEW PORT     %-18s %d/tcp   %s\n", c.IP, c.Port, c.After)
 				case "CLOSED_PORT":
@@ -2176,9 +2287,10 @@ func runDiff(file1, file2, outputFormat, outFile string) int {
 					fmt.Printf("[~] CHANGED      %-18s %d/tcp   %s  →  %s\n", c.IP, c.Port, c.Before, c.After)
 				}
 			}
-			fmt.Printf("\nSummary: +%d hosts  -%d hosts  +%d ports  -%d ports  %d banner changes\n",
+			fmt.Printf("\nSummary: +%d hosts  -%d hosts  +%d ports  -%d ports  %d banner changes  %d hostnames moved\n",
 				report.Summary.NewHosts, report.Summary.ClosedHosts,
-				report.Summary.NewPorts, report.Summary.ClosedPorts, report.Summary.ChangedBanner)
+				report.Summary.NewPorts, report.Summary.ClosedPorts, report.Summary.ChangedBanner,
+				report.Summary.HostnamesMoved)
 		}
 	}
 
@@ -2195,6 +2307,341 @@ func parseTarget(target string) ([]string, error) {
 		return parseCIDR(target)
 	}
 	return []string{target}, nil
+}
+
+// targetSpec is one target exactly as the user wrote it, tagged with where it
+// came from so an error can point at the offending line of a -iL file.
+type targetSpec struct {
+	text   string
+	origin string // "file:line" for -iL entries; empty for command-line arguments
+}
+
+func (t targetSpec) errorf(format string, a ...any) error {
+	msg := fmt.Sprintf(format, a...)
+	if t.origin == "" {
+		return errors.New(msg)
+	}
+	return fmt.Errorf("%s: %s", t.origin, msg)
+}
+
+type specKind int
+
+const (
+	specIP specKind = iota
+	specCIDR
+	specHostname
+)
+
+const (
+	dnsResolveTimeout = 10 * time.Second
+	dnsResolveWorkers = 16
+)
+
+// parseTargetSpecs expands target specs (IPs, CIDRs, hostnames) into one
+// deduplicated IP list, plus the ip→hostnames mapping discovered on the way.
+// Overlapping entries — a /24 plus a host inside it — are common in a target
+// file, and scanning a host twice would double-count it in the totals and emit
+// two entries in the report.
+//
+// Hostnames are resolved here, once, rather than being passed down to the probe
+// paths as names. Dialing by name would re-resolve on every port probe, would
+// scatter a round-robin name's ports across different machines, and would leave
+// the host sorted as 0 by ipToUint32 — making output order nondeterministic and
+// breaking the stable-output contract that diff mode depends on.
+func parseTargetSpecs(specs []targetSpec) ([]string, map[string][]string, error) {
+	kinds := make([]specKind, len(specs))
+	var names []string
+	nameSeen := make(map[string]bool)
+	for i, spec := range specs {
+		kind, err := classifyTargetSpec(spec.text)
+		if err != nil {
+			return nil, nil, spec.errorf("%s", err)
+		}
+		kinds[i] = kind
+		if kind == specHostname && !nameSeen[spec.text] {
+			nameSeen[spec.text] = true
+			names = append(names, spec.text)
+		}
+	}
+
+	resolved, resolveErrs := resolveHostnames(names)
+	for i, spec := range specs {
+		if kinds[i] == specHostname {
+			if err := resolveErrs[spec.text]; err != nil {
+				return nil, nil, spec.errorf("cannot resolve %q: %v", spec.text, err)
+			}
+		}
+	}
+
+	seen := make(map[string]bool)
+	var ips []string
+	hostnames := make(map[string][]string)
+	add := func(ip string) {
+		if !seen[ip] {
+			seen[ip] = true
+			ips = append(ips, ip)
+		}
+	}
+
+	for i, spec := range specs {
+		if kinds[i] == specHostname {
+			for _, ip := range resolved[spec.text] {
+				add(ip)
+				hostnames[ip] = appendUnique(hostnames[ip], spec.text)
+			}
+			continue
+		}
+		expanded, err := parseTarget(spec.text)
+		if err != nil {
+			return nil, nil, spec.errorf("%s", err)
+		}
+		for _, ip := range expanded {
+			add(ip)
+		}
+	}
+
+	// Sorted so repeated runs emit an identical host record.
+	for ip := range hostnames {
+		sort.Strings(hostnames[ip])
+	}
+	return ips, hostnames, nil
+}
+
+func appendUnique(list []string, s string) []string {
+	for _, existing := range list {
+		if existing == s {
+			return list
+		}
+	}
+	return append(list, s)
+}
+
+// resolveHostnames looks up each name's IPv4 addresses concurrently, once per
+// name. Errors are returned per name rather than aggregated so the caller can
+// attribute a failure back to the target-file line that caused it.
+func resolveHostnames(names []string) (map[string][]string, map[string]error) {
+	out := make(map[string][]string, len(names))
+	errs := make(map[string]error, len(names))
+	if len(names) == 0 {
+		return out, errs
+	}
+
+	workers := dnsResolveWorkers
+	if len(names) < workers {
+		workers = len(names)
+	}
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	jobs := make(chan string)
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for name := range jobs {
+				ctx, cancel := context.WithTimeout(context.Background(), dnsResolveTimeout)
+				addrs, err := net.DefaultResolver.LookupIP(ctx, "ip4", name)
+				cancel()
+
+				var ips []string
+				for _, a := range addrs {
+					if v4 := a.To4(); v4 != nil {
+						ips = append(ips, v4.String())
+					}
+				}
+				// DNS rotates round-robin answers between queries; sort so the scan
+				// order and the resulting report are identical from run to run.
+				sortIPsNumerically(ips)
+
+				mu.Lock()
+				switch {
+				case err != nil:
+					errs[name] = err
+				case len(ips) == 0:
+					errs[name] = errors.New("no IPv4 address")
+				default:
+					out[name] = ips
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	for _, n := range names {
+		jobs <- n
+	}
+	close(jobs)
+	wg.Wait()
+	return out, errs
+}
+
+// readTargetFile reads an nmap-style target list (-iL): one or more targets per
+// line, separated by whitespace or commas. Blank lines and "#" comments are
+// ignored. A path of "-" reads from stdin.
+//
+// Each entry keeps its file:line origin so that a bad or unresolvable target is
+// reported against the line that introduced it. Validation happens before the
+// scan starts rather than at probe time: a typo in a list of thousands would
+// otherwise become a phantom target that quietly reports as down, and the
+// operator would never learn that a subnet went unscanned.
+func readTargetFile(path string) ([]targetSpec, error) {
+	var r io.Reader
+	if path == "-" {
+		r = os.Stdin
+	} else {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		r = f
+	}
+
+	name := path
+	if path == "-" {
+		name = "<stdin>"
+	}
+
+	var specs []targetSpec
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for lineNo := 1; sc.Scan(); lineNo++ {
+		line := sc.Text()
+		if i := strings.IndexByte(line, '#'); i >= 0 {
+			line = line[:i]
+		}
+		fields := strings.FieldsFunc(line, func(r rune) bool {
+			return r == ',' || unicode.IsSpace(r)
+		})
+		for _, field := range fields {
+			specs = append(specs, targetSpec{
+				text:   field,
+				origin: fmt.Sprintf("%s:%d", name, lineNo),
+			})
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("reading %s: %w", name, err)
+	}
+	if len(specs) == 0 {
+		return nil, fmt.Errorf("no targets found in %s", name)
+	}
+	return specs, nil
+}
+
+// classifyTargetSpec decides what a target is — an IPv4 address, an IPv4 CIDR,
+// or a hostname — and rejects everything else.
+//
+// IPv6 is rejected explicitly: the scanner is IPv4-only throughout (ICMP echo
+// via ipv4, and ipToUint32 sorting), and enumerating an IPv6 prefix would
+// exhaust memory long before it produced a scannable host list.
+func classifyTargetSpec(spec string) (specKind, error) {
+	if spec == "" {
+		return 0, errors.New("empty target")
+	}
+	if strings.Contains(spec, "://") {
+		return 0, urlNotSupported(spec)
+	}
+	if strings.Contains(spec, "/") {
+		ip, _, err := net.ParseCIDR(spec)
+		if err != nil {
+			// "example.com/status" is a URL missing its scheme, not a malformed
+			// CIDR — say so rather than pointing the user at CIDR syntax. The
+			// letter test keeps a genuinely bad CIDR ("10.0.0.0/33") out of this
+			// branch: all-numeric labels are valid hostname syntax but nobody
+			// means them as a name.
+			if host := spec[:strings.IndexByte(spec, '/')]; containsLetter(host) && validateHostname(host) == nil {
+				return 0, urlNotSupported(spec)
+			}
+			return 0, fmt.Errorf("invalid CIDR %q", spec)
+		}
+		if ip.To4() == nil {
+			return 0, fmt.Errorf("IPv6 CIDR %q is not supported (IPv4 only)", spec)
+		}
+		return specCIDR, nil
+	}
+	if ip := net.ParseIP(spec); ip != nil {
+		if ip.To4() == nil {
+			return 0, fmt.Errorf("IPv6 address %q is not supported (IPv4 only)", spec)
+		}
+		return specIP, nil
+	}
+	// A spec with no letters in it is a malformed address, not a name: report
+	// "10.0.0.300" as a bad IP rather than sending it to DNS and blaming the
+	// resolver for the typo.
+	if !containsLetter(spec) {
+		return 0, fmt.Errorf("invalid IP address %q", spec)
+	}
+	if err := validateHostname(spec); err != nil {
+		return 0, err
+	}
+	return specHostname, nil
+}
+
+func containsLetter(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' {
+			return true
+		}
+	}
+	return false
+}
+
+// urlNotSupported reports a URL target, naming the bare hostname to use instead.
+// A URL also implies a port, which would silently contradict -p; refusing is
+// clearer than guessing which the operator meant.
+func urlNotSupported(spec string) error {
+	host := spec
+	if i := strings.Index(host, "://"); i >= 0 {
+		host = host[i+3:]
+	}
+	if i := strings.IndexAny(host, "/?#"); i >= 0 {
+		host = host[:i]
+	}
+	if i := strings.LastIndexByte(host, '@'); i >= 0 { // strip user:pass@
+		host = host[i+1:]
+	}
+	if i := strings.LastIndexByte(host, ':'); i >= 0 { // strip :8443
+		host = host[:i]
+	}
+	if host == "" || validateHostname(host) != nil {
+		return fmt.Errorf("URLs are not supported — use a bare hostname or IP instead of %q", spec)
+	}
+	return fmt.Errorf("URLs are not supported — use the hostname %q instead of %q", host, spec)
+}
+
+// validateHostname checks DNS name syntax (RFC 1123): dot-separated labels of
+// letters, digits and hyphens, no leading or trailing hyphen, 63 bytes per
+// label and 253 overall. Syntax only — resolution happens later.
+func validateHostname(h string) error {
+	name := strings.TrimSuffix(h, ".") // tolerate a fully-qualified trailing dot
+	if name == "" {
+		return fmt.Errorf("invalid target %q", h)
+	}
+	if len(name) > 253 {
+		return fmt.Errorf("hostname %q is too long (max 253 characters)", h)
+	}
+	for _, label := range strings.Split(name, ".") {
+		if label == "" {
+			return fmt.Errorf("invalid hostname %q (empty label)", h)
+		}
+		if len(label) > 63 {
+			return fmt.Errorf("invalid hostname %q (label %q exceeds 63 characters)", h, label)
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return fmt.Errorf("invalid hostname %q (label %q starts or ends with a hyphen)", h, label)
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			switch {
+			case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-':
+			default:
+				return fmt.Errorf("invalid target %q", h)
+			}
+		}
+	}
+	return nil
 }
 
 func parseCIDR(cidr string) ([]string, error) {
